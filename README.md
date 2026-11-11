@@ -72,6 +72,19 @@ The online test uses the community [playDB-CNT launcher](https://github.com/siko
 
 Some of these fixes have since been implemented or superseded in upstream `nx2`; this branch keeps the newer upstream implementation instead of blindly reapplying an older patch. The compatibility and performance of the Network Test can still vary with the game build, system files, GPU driver and launcher configuration. No game files, keys or firmware are included.
 
+
+### ملخص عربي
+
+يحتفظ هذا الفرع بتكامل *The Duskbloods Network Test* مع مشغّل [playDB-CNT](https://github.com/sikoGD/playDB-CNT)، إلى جانب إصلاحات الرسوميات والأداء الخاصة بالنسخة القديمة، بعد دمجها مع فرع Lichii الأصلي الأحدث `nx2`.
+
+1. فكّ ملفات المحاكي في مجلد قصير، وثبّت مفاتيحك وملفات النظام التي حصلت عليها قانونيًا.
+2. في ملف `launcher_settings.json` داخل playDB-CNT، اجعل `emulator` يشير إلى ملف `lichii.exe` في هذا الفرع، واجعل `game` يشير إلى مجلد نسختك من اللعبة.
+3. شغّل `Play.Duskbloods.exe` وابدأ اللعبة من خلال المشغّل. لا تشغّل الاختبار مباشرة من `lichii.exe`، لأن المشغّل يجهّز إعدادات الاتصال بالخوادم المحلية.
+
+يتضمن التكامل إعادة توجيه الاتصال، وضوابط الشبكة المحلية، وشهادة TLS الخاصة بالمشغّل، وإصلاحات الضباب ثلاثي الأبعاد ومخزن بيانات الـ upscaler، وتحسينات ترجمة الـ shaders والوصول إلى الذاكرة. بعض هذه الإصلاحات أصبح موجودًا أصلًا في upstream، لذلك احتُفظ بتنفيذ upstream الأحدث بدل تكرار الرقع القديمة.
+
+التوافق والأداء غير مضمونين ويعتمدان على إصدار اللعبة وملفات النظام وتعريف بطاقة الرسوميات وإعداد المشغّل. لا يتضمن هذا المشروع اللعبة أو المفاتيح أو ملفات النظام.
+
 ## Compatibility and issue reports
 
 Compatibility and performance vary by game, hardware and driver. Rendering errors, stutters and crashes remain possible. Passing automated tests does not establish that a game renders correctly, and this project makes no universal frame-rate guarantee.
