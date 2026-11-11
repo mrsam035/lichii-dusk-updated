@@ -2,7 +2,7 @@ name: build-check
 
 on:
   pull_request:
-    branches: [nx2, dusk-v2]
+    branches: [nx2, dusk-v2, integrate/nx2-upstream-duskbloods]
   push:
     branches:
       - nx2
