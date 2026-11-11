@@ -55,8 +55,8 @@ The online test uses the community [playDB-CNT launcher](https://github.com/siko
 
    ```json
    {
-     "emulator": "C:\\\\Games\\\\Lichii-Duskbloods\\\\lichii.exe",
-     "game": "C:\\\\Games\\\\THE DUSKBLOODS NETWORK TEST"
+     "emulator": "C:\\Games\\Lichii-Duskbloods\\lichii.exe",
+     "game": "C:\\Games\\THE DUSKBLOODS NETWORK TEST"
    }
    ```
 
