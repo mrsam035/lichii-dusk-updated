@@ -180,6 +180,15 @@ jobs:
              the Network Test directly from lichii.exe; the launcher supplies its local test
              connection configuration.
 
+          This build applies Duskbloods memory sizing automatically from the game's title ID.
+          It ignores legacy EDEN_NX2_APP_POOL_PROBE and EDEN_NX2_GPU_MAP_FLAG_PROBE overrides
+          that older playDB-CNT launchers may still pass; do not set these manually.
+
+          On Windows with 16 GB RAM, keep the Windows page file enabled (System managed is safest).
+          Switch 2 titles can commit about 14 GiB of guest memory at startup, plus temporary host
+          memory for first-time shader compilation. Leave "Build all cached shaders before game start"
+          off unless there is ample memory-commit headroom.
+
           This package contains the emulator and its Windows runtime files only. It does not
           include the game, keys, firmware, or playDB-CNT launcher. The normal Lichii profile is
           stored under %APPDATA%\lichii unless you provide a portable user folder yourself.
