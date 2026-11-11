@@ -4,8 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-##include <random>
-#
+#include <random>
+
 #include "common/literals.h"
 #include "common/random.h"
 #include "common/settings.h"
