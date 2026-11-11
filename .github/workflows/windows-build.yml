@@ -15,7 +15,7 @@ on:
       - "*.profdata"
       - ".github/workflows/windows-build.yml"
   push:
-    branches: [dusk-v2]
+    branches: [dusk-v2, duskbloods-runtime-fixes-2026-11-12]
     paths:
       - "src/**"
       - "CMakeLists.txt"
