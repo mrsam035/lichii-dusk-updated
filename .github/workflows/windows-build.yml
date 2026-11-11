@@ -110,7 +110,7 @@ jobs:
             -DYUZU_USE_BUNDLED_QT=OFF \
             -DENABLE_QT_TRANSLATION=ON \
             -DYUZU_USE_BUNDLED_SDL3=ON \
-            -DENABLE_UPDATE_CHECKER=OFF \
+            -DENABLE_UPDATE_CHECKER=ON \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON \
             "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
