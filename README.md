@@ -35,6 +35,43 @@ Lichii uses its own profile: `%APPDATA%\lichii` on Windows, and the `lichii` dir
 
 On the first non-portable GUI launch, Lichii offers to import Eden and other detected emulator profiles. Back up `%APPDATA%\eden` first on Windows, or the old data, config and cache directories on Unix, and close the source emulator. Choose **Keep Old Data** to copy without changing the source, then check your saves and relaunch. Existing destination data is retained in backup directories rather than merged. Move also retains a source backup until you remove it yourself; Link deliberately shares settings and saves. Paths outside the imported data root remain shared and unchanged. An interrupted import offers recovery on the next launch. `eden-cli`, including `--help` and `--version`, refuses to initialize configuration until you import or explicitly choose **Start fresh** in the GUI.
 
+## The Duskbloods Network Test (playDB-CNT integration)
+
+This integration branch also preserves the Duskbloods-specific changes from the older Lichii-Duskbloods fork. It is a community-maintained build on top of the current `nx2` branch; it is not an official upstream Lichii release and is not affiliated with Nintendo or FromSoftware.
+
+The online test uses the community [playDB-CNT launcher](https://github.com/sikoGD/playDB-CNT), which starts the emulator with the local network-test server configuration.
+
+### Requirements
+
+- A legally obtained copy of *The Duskbloods Network Test* and the Switch 2 system files required by Lichii.
+- Windows 10/11 x64 for the supplied playDB-CNT launcher.
+- The [playDB-CNT launcher](https://github.com/sikoGD/playDB-CNT), configured according to its own documentation.
+
+### Launching the Network Test
+
+1. Extract the integration build to a short, writable folder, for example `C:\\Games\\Lichii-Duskbloods\\`.
+2. Install your own decryption keys and firmware using Lichii's **Tools** menu.
+3. Configure `launcher_settings.json` in playDB-CNT so that `emulator` points to this build's `lichii.exe` and `game` points to your Network Test game folder. For example:
+
+   ```json
+   {
+     "emulator": "C:\\\\Games\\\\Lichii-Duskbloods\\\\lichii.exe",
+     "game": "C:\\\\Games\\\\THE DUSKBLOODS NETWORK TEST"
+   }
+   ```
+
+4. Start `Play.Duskbloods.exe` and launch the game from the launcher. Do not start the Network Test directly from `lichii.exe`: the launcher supplies the local online-test configuration required by the game.
+
+### Preserved Duskbloods-specific changes
+
+- playDB-CNT online integration, including launcher-driven host redirection, loopback-only networking controls, and trust for the launcher's local test certificate.
+- Duskbloods-specific BCAT handling.
+- Native shader translation fixes and stack-related shader handling.
+- Vulkan fixes for layered fog-volume clears and the neural-upscaler scratch-buffer clear.
+- Faster GPU-memory subrange lookup and the fork's Duskbloods performance controls.
+
+Some of these fixes have since been implemented or superseded in upstream `nx2`; this branch keeps the newer upstream implementation instead of blindly reapplying an older patch. The compatibility and performance of the Network Test can still vary with the game build, system files, GPU driver and launcher configuration. No game files, keys or firmware are included.
+
 ## Compatibility and issue reports
 
 Compatibility and performance vary by game, hardware and driver. Rendering errors, stutters and crashes remain possible. Passing automated tests does not establish that a game renders correctly, and this project makes no universal frame-rate guarantee.

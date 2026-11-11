@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <string_view>
 
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -98,6 +99,12 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
             R_SUCCEED();
         }
         case InfoType::Nx2RemoteMemorySize:
+            if (const char* probe = std::getenv("EDEN_NX2_APP_POOL_PROBE");
+                probe != nullptr && std::string_view{probe} == "1152") {
+                *result = 512ULL * 1024 * 1024;
+                LOG_WARNING(Kernel_SVC, "Experimental remote memory size: {:#x}", *result);
+                R_SUCCEED();
+            }
             // Unknown real value; the application pool backs it (see Nx2RemoteMemorySize). The
             // Duskbloods network test crashes on a null pointer if it is 0 (playDB-CNT issue 2).
             *result = KSystemControl::Nx2RemoteMemorySize();
