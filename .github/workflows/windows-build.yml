@@ -1,0 +1,207 @@
+name: windows-build
+
+on:
+  pull_request:
+    branches: [dusk-v2]
+    paths:
+      - "src/**"
+      - "CMakeLists.txt"
+      - "CMakeModules/**"
+      - "externals/**"
+      - "dist/**"
+      - "tools/**"
+      - ".patch/**"
+      - "cpmfile.json"
+      - "*.profdata"
+      - ".github/workflows/windows-build.yml"
+  push:
+    branches: [dusk-v2]
+    paths:
+      - "src/**"
+      - "CMakeLists.txt"
+      - "CMakeModules/**"
+      - "externals/**"
+      - "dist/**"
+      - "tools/**"
+      - ".patch/**"
+      - "cpmfile.json"
+      - "*.profdata"
+      - ".github/workflows/windows-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    name: Windows x64 Release build and package
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+
+      - name: Install pinned LLVM toolchain
+        shell: pwsh
+        run: ./tools/windows/install-llvm.ps1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install ccache
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'ccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/ccache/ccache/releases/download/v4.14.2/ccache-4.14.2-windows-x86_64.zip
+          if ((Get-FileHash -Algorithm SHA256 $zip).Hash -ne '6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84') {
+              throw 'ccache checksum mismatch'
+          }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          Join-Path $env:RUNNER_TEMP 'ccache-4.14.2-windows-x86_64' | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Restore dependencies and compiler cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: lichii-windows-release-qt683-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            lichii-windows-release-qt683-${{ runner.os }}-
+
+      - name: Configure Windows Release
+        run: |
+          set -euo pipefail
+          flags="-DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin"
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DENABLE_QT=ON \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DENABLE_QT_TRANSLATION=ON \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON \
+            "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
+            "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            "-DCMAKE_C_FLAGS=$flags" \
+            "-DCMAKE_CXX_FLAGS=-EHsc $flags"
+
+      - name: Build Windows executables
+        env:
+          CCACHE_COMPILERCHECK: string:${{ hashFiles('tools/windows/install-llvm.ps1') }}
+        run: |
+          set -euo pipefail
+          ccache --zero-stats
+          cmake --build build/release --target yuzu yuzu-cmd lichii-updater --parallel
+          ccache --show-stats -v
+          for exe in lichii.exe eden-cli.exe lichii-updater.exe; do
+            test -s "build/release/bin/$exe"
+          done
+
+      - name: Verify static nxformat linkage
+        run: |
+          set -euo pipefail
+          imports=$("$LLVM_ROOT/bin/llvm-readobj" --coff-imports build/release/bin/lichii.exe |
+            awk '/^(Import|DelayImport) {/ { kind = $1 } /^  Name:/ { print kind, $2 }')
+          echo "$imports"
+          if grep -qi ' nxformat.dll$' <<< "$imports"; then
+            echo "::error::lichii.exe imports nxformat.dll; nxformat must be linked statically"
+            exit 1
+          fi
+
+      - name: Deploy Qt runtime and prepare package
+        shell: pwsh
+        run: |
+          $bin = "build/release/bin"
+          & windeployqt --release --no-translations "$bin/lichii.exe"
+          if ($LASTEXITCODE -ne 0) {
+            throw "windeployqt failed with exit code $LASTEXITCODE"
+          }
+          foreach ($required in @(
+            "$bin/lichii.exe",
+            "$bin/eden-cli.exe",
+            "$bin/lichii-updater.exe",
+            "$bin/Qt6Core.dll",
+            "$bin/platforms/qwindows.dll"
+          )) {
+            if (-not (Test-Path $required)) {
+              throw "Required Windows package file is missing: $required"
+            }
+          }
+          Copy-Item "LICENSE.txt" "$bin/LICENSE.txt" -Force
+          if (Test-Path "LICENSES") {
+            Copy-Item "LICENSES" "$bin/LICENSES" -Recurse -Force
+          }
+          @'
+          Lichii — Duskbloods integration build (Windows x64)
+
+          1. Extract the entire package to a short, writable folder. Do not run the EXE from inside
+             the ZIP and do not separate the DLLs from lichii.exe.
+          2. Start lichii.exe once and install your own legally obtained decryption keys and
+             Switch 2 firmware through the Tools menu.
+          3. Configure launcher_settings.json in the separate playDB-CNT launcher:
+               emulator = full path to this folder's lichii.exe
+               game     = full path to your legally obtained Duskbloods Network Test dump
+          4. Start Play.Duskbloods.exe and launch the Network Test from the launcher. Do not start
+             the Network Test directly from lichii.exe; the launcher supplies its local test
+             connection configuration.
+
+          This package contains the emulator and its Windows runtime files only. It does not
+          include the game, keys, firmware, or playDB-CNT launcher. The normal Lichii profile is
+          stored under %APPDATA%\lichii unless you provide a portable user folder yourself.
+
+          This is an automated Release-mode build artifact. A successful build does not by itself
+          confirm successful login or correct in-game rendering; those still need a real test.
+          '@ | Set-Content -Path "$bin/README-DUSKBLOODS.txt" -Encoding utf8
+
+      - name: Upload Windows x64 build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-duskbloods-windows-x64-${{ github.sha }}
+          path: build/release/bin/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Save dependency and compiler cache
+        if: always()
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: lichii-windows-release-qt683-${{ runner.os }}-${{ github.sha }}
