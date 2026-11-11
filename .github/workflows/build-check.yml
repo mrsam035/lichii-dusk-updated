@@ -214,6 +214,14 @@ jobs:
           restore-keys: |
             clang-cl-ccache-qt683-${{ runner.os }}-
 
+      - name: Clear incomplete cached Boost source
+        shell: pwsh
+        run: |
+          $boost = '.cache/cpm/boost/1.92.0'
+          if (Test-Path $boost) {
+              Remove-Item -Recurse -Force $boost
+          }
+
       - name: Configure production and tests
         run: >-
           cmake -S . -B build -G Ninja
