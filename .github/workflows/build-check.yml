@@ -8,6 +8,7 @@ on:
       - nx2
       - dusk-v2
       - 'integrate/**'
+      - duskbloods-runtime-fixes-2026-11-12
   workflow_dispatch:
 
 permissions:
