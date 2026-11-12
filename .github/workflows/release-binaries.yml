@@ -11,6 +11,7 @@ on:
     branches:
       - nx2-experimental
       - dusk-v2
+    # Duskbloods fork's primary branch; publish its Windows and Linux packages too.
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
