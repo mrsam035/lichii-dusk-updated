@@ -2,12 +2,13 @@ name: build-check
 
 on:
   pull_request:
-    branches: [nx2, dusk-v2]
+    branches: [nx2, dusk-v2, integrate/nx2-upstream-duskbloods]
   push:
     branches:
       - nx2
       - dusk-v2
       - 'integrate/**'
+      - duskbloods-runtime-fixes-2026-11-12
   workflow_dispatch:
 
 permissions:
@@ -212,6 +213,14 @@ jobs:
           key: clang-cl-ccache-qt683-${{ runner.os }}-${{ github.sha }}
           restore-keys: |
             clang-cl-ccache-qt683-${{ runner.os }}-
+
+      - name: Clear incomplete cached Boost source
+        shell: pwsh
+        run: |
+          $boost = '.cache/cpm/boost/1.92.0'
+          if (Test-Path $boost) {
+              Remove-Item -Recurse -Force $boost
+          }
 
       - name: Configure production and tests
         run: >-
