@@ -607,7 +607,16 @@ jobs:
                 [[ -e "$file" ]] && cp "$file" "dist/$(strip_sha "$(basename "$file")")"
               done
             else
-              (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
+              if [[ "$name" == lichii-windows-x86_64-* ]]; then
+                if [[ "$name" == *-pgo-* ]]; then
+                  output="lichii-windows-dusk-updated-x86_64-pgo.zip"
+                else
+                  output="lichii-windows-dusk-updated-x86_64.zip"
+                fi
+                (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$output" .)
+              else
+                (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
+              fi
             fi
           done
           ls -la dist
@@ -675,7 +684,7 @@ jobs:
           Windows packages are in-place zip files: extract and run \`lichii.exe\`, or \`eden-cli.exe\` from a terminal.
 
           $({
-            row "amd64 / x86_64" "$(link zip lichii-windows-x86_64.zip)" "$(link "PGO zip" lichii-windows-x86_64-pgo.zip)" "Both built with clang-cl and ThinLTO; the PGO zip adds a profile trained on Ocarina of Time"
+            row "amd64 / x86_64" "$(link zip lichii-windows-dusk-updated-x86_64.zip)" "$(link "PGO zip" lichii-windows-dusk-updated-x86_64-pgo.zip)" "Both built with clang-cl and ThinLTO; the PGO zip adds a profile trained on Ocarina of Time"
           } | table)
 
           ## macOS
