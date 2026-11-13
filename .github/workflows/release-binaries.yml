@@ -614,7 +614,7 @@ jobs:
           retention-days: 7
 
   # Publishes every binary as a GitHub pre-release once every platform built: on pushes to
-  # nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
+  # nx2-experimental or dusk-v2, and on manual runs unless "Publish the binaries as a GitHub release" is
   # unticked.
   release:
     name: Publish release
@@ -650,7 +650,16 @@ jobs:
                 [[ -e "$file" ]] && cp "$file" "dist/$(strip_sha "$(basename "$file")")"
               done
             else
-              (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
+              if [[ "$name" == lichii-windows-x86_64-* ]]; then
+                if [[ "$name" == *-pgo-* ]]; then
+                  output="lichii-windows-dusk-updated-x86_64-pgo.zip"
+                else
+                  output="lichii-windows-dusk-updated-x86_64.zip"
+                fi
+                (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$output" .)
+              else
+                (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
+              fi
             fi
           done
           ls -la dist
@@ -700,6 +709,10 @@ jobs:
           cat > notes.md <<EOF
           Automatic build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}.
 
+          ## Duskbloods
+
+          `EDEN_NX2_TEMPORAL_WEIGHT=1` is enabled by default from the packaged `nx2_switches.txt`; no external BAT launcher is required.
+
           ## Linux
 
           Linux packages come as an AppImage and a tar.gz. Both are self-contained and need glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch). The tar.gz holds the same files unpacked, for systems without FUSE: extract it and run \`lichii/lichii\`.
@@ -714,7 +727,7 @@ jobs:
           Windows packages are in-place zip files: extract and run \`lichii.exe\`, or \`eden-cli.exe\` from a terminal.
 
           $({
-            row "amd64 / x86_64" "$(link zip lichii-windows-x86_64.zip)" "$(link "PGO zip" lichii-windows-x86_64-pgo.zip)" "Both built with clang-cl and ThinLTO; the PGO zip adds a profile trained on Ocarina of Time"
+            row "amd64 / x86_64" "$(link zip lichii-windows-dusk-updated-x86_64.zip)" "$(link "PGO zip" lichii-windows-dusk-updated-x86_64-pgo.zip)" "Both built with clang-cl and ThinLTO; the PGO zip adds a profile trained on Ocarina of Time"
           } | table)
 
           ## macOS
