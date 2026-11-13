@@ -29,6 +29,9 @@ EDEN_NX2_FENCE_BATCH=1
 # Ocarina of Time with =0 (or =2): 30.9 fps against 38.9 unset, same spot and settings.
 #EDEN_NX2_FRAMES_AHEAD=1
 
+
+# Duskbloods temporal-weight workaround, previously supplied by Play.Duskbloods.bat.
+EDEN_NX2_TEMPORAL_WEIGHT=1
 # --- Workarounds / Debug ---
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0

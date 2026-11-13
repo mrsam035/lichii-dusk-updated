@@ -570,8 +570,8 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  # Publishes every binary as a GitHub pre-release once every platform built: on pushes to
-  # nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
+  # Publishes one final GitHub release once every platform built: on pushes to
+  # nx2-experimental or dusk-v2, and on manual runs unless "Publish the binaries as a GitHub release" is
   # unticked.
   release:
     name: Publish release
@@ -657,6 +657,10 @@ jobs:
           cat > notes.md <<EOF
           Automatic build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}.
 
+          ## Duskbloods
+
+          `EDEN_NX2_TEMPORAL_WEIGHT=1` is enabled by default from the packaged `nx2_switches.txt`; no external BAT launcher is required.
+
           ## Linux
 
           Linux packages come as an AppImage and a tar.gz. Both are self-contained and need glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch). The tar.gz holds the same files unpacked, for systems without FUSE: extract it and run \`lichii/lichii\`.
@@ -684,8 +688,7 @@ jobs:
           gh release create "${tag}" dist/* \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
-            --prerelease \
-            --title "Lichii ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+            --title "Lichii ${GITHUB_REF_NAME} FINAL build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
             --notes-file notes.md
 
       # LICHII_BUILD_TAG is baked into every binary as build-<run number>, and the update checker
@@ -704,3 +707,20 @@ jobs:
             echo "Release is tagged '$published_tag' and titled '$published_title', expected tag $expected and a title naming build ${GITHUB_RUN_NUMBER}"
             exit 1
           fi
+
+      # Delete only the two superseded pre-releases, and only after the new release and its
+      # tag have both been created and verified successfully.
+      - name: Remove superseded releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for tag in build-1 build-2; do
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+            fi
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}"
+            fi
+          done
