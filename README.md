@@ -2,7 +2,7 @@
 
 A community-maintained emulator build focused on **The Duskbloods**.
 
-This project continues the older **Lichii-Dusk** fork, updating its codebase to **Lichii 160** because the original Lichii-Dusk build was no longer being updated. It also includes additional fixes and improvements aimed at running The Duskbloods.
+This project continues the older **Lichii-Dusk** fork, updating its codebase to **Lichii 177** because the original Lichii-Dusk build was no longer being updated. It also includes additional fixes and improvements aimed at running The Duskbloods.
 
 This is an independent community project. It is not an official release of Lichii and is not affiliated with Nintendo or FromSoftware.
 
@@ -47,7 +47,7 @@ This fork preserves the Duskbloods-specific integration from the original Lichii
 - Native shader translation and stack-related shader fixes.
 - Vulkan fixes for layered fog-volume clears and the neural-upscaler scratch-buffer clear.
 - Faster GPU-memory subrange lookup and additional performance controls.
-- Further updates and fixes inherited from the Lichii 160 codebase.
+- Further updates and fixes inherited from the Lichii 177 codebase.
 
 Some fixes from the original fork have since been implemented or superseded upstream. This project keeps the newer implementation where appropriate instead of blindly reapplying older patches.
 
