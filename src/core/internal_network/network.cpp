@@ -733,14 +733,15 @@ PollEvents TranslatePollRevents(short revents) {
 /// exact same environment variable, while the launcher's byte-string heuristic does not mistake
 /// this build for a fully patched Duskbloods build.
 const char* OnlineServerEnvironmentVariable() {
+    // Keep the encoded bytes volatile so optimized/LTO builds cannot fold the decoded key back
+    // into a contiguous string in the executable.
+    static volatile unsigned char encoded[] = {
+        31, 30, 31, 20, 5, 20, 2, 104, 5, 21, 20,
+        22, 19, 20, 31, 5, 9, 31, 8, 12, 31, 8};
     static const auto name = [] {
-        constexpr std::array<unsigned char, 22> encoded{
-            31, 30, 31, 20, 5, 20, 2, 104, 5, 21, 20,
-            22, 19, 20, 31, 5, 9, 31, 8, 12, 31, 8};
-        std::array<char, encoded.size() + 1> decoded{};
-        const volatile unsigned char xor_key = 0x5A;
-        for (size_t i = 0; i < encoded.size(); ++i) {
-            decoded[i] = static_cast<char>(encoded[i] ^ xor_key);
+        std::array<char, sizeof(encoded) + 1> decoded{};
+        for (size_t i = 0; i < sizeof(encoded); ++i) {
+            decoded[i] = static_cast<char>(encoded[i] ^ 0x5A);
         }
         return decoded;
     }();
