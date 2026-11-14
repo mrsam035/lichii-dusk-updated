@@ -40,6 +40,7 @@
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
+#include "video_core/nx2_dusk_accuracy.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/textures/decoders.h"
 
@@ -2212,14 +2213,17 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         runtime.TransitionImageLayout(image);
         return;
     }
-    if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
+    // The Duskbloods diagnostic keeps texture decoding on the draw thread so a draw cannot
+    // observe a placeholder image while its host-side conversion is still in flight.
+    if (True(image.flags & ImageFlagBits::AsynchronousDecode) &&
+        !DuskAccuracy::Enabled()) {
         QueueAsyncDecode(image, image_id);
         return;
     }
 
     const bool gpu_unswizzle_enabled = Settings::values.gpu_unswizzle_enabled.GetValue();
 
-    if (gpu_unswizzle_enabled &&
+    if (gpu_unswizzle_enabled && !DuskAccuracy::Enabled() &&
         IsPixelFormatBCn(image.info.format) &&
         image.info.type == ImageType::e3D &&
         image.info.resources.levels == 1 &&
