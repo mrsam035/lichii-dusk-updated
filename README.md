@@ -60,7 +60,7 @@ The experiment prioritizes deterministic GPU/memory behavior over frame rate:
 - Disables asynchronous GPU submission and the Switch 2 GPU split thread.
 - Forces high GPU accuracy, safe DMA behavior, accurate GPU-fence behavior, and reactive flushing for guest CPU reads.
 - Disables the NX2 performance shortcuts and enables the available verification/readback checks.
-- Uses conservative frame pacing and cache invalidation settings, and requests buffer readbacks even when they are expensive.
+- Uses synchronous texture decode/unswizzle, conservative frame pacing and cache invalidation, and requests buffer readbacks even when they are expensive.
 - Keeps the existing `EDEN_NX2_TEMPORAL_WEIGHT=1` Duskbloods workaround.
 
 Expect substantially lower FPS, longer stalls, and more CPU/GPU waiting. That is intentional for this experiment. It does not promise to fix the visual issue: the first goal is to determine whether the artifact is caused by asynchronous execution, stale data, or memory/cache synchronization. If the image is still corrupted in this mode, the next investigation should focus on the specific shader, texture, render-target, or format-conversion path rather than performance tuning.
