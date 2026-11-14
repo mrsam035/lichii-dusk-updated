@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
@@ -17,6 +16,7 @@
 #include "core/file_sys/romfs.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/hle/service/ssl/cert_store.h"
+#include "core/internal_network/local_redirect.h"
 
 namespace Service::SSL {
 
@@ -24,6 +24,14 @@ namespace Service::SSL {
 
 CertStore::CertStore(Core::System& system) {
     constexpr u64 CertStoreDataId = 0x0100000000000800ULL;
+
+    if (const auto test_ca = Network::LocalRedirect::TestCa(); !test_ca.empty()) {
+        constexpr auto TestCaId = static_cast<CaCertificateId>(0x7FFF0001);
+        m_test_ca.emplace(TestCaId, Certificate{
+                                        .status = TrustedCertStatus::EnabledTrusted,
+                                        .der_data = {test_ca.begin(), test_ca.end()},
+                                    });
+    }
 
     auto& fsc = system.GetFileSystemController();
 
@@ -102,7 +110,10 @@ void CertStore::ForEachCertificate(std::span<const CaCertificateId> certificate_
         }
         return out;
     }();
-    if (online_ca) {
+    // Prefer the upstream settings CA when configured; otherwise keep the launcher CA fallback.
+    if (m_test_ca) {
+        f(*m_test_ca);
+    } else if (online_ca) {
         f(*online_ca);
     }
     if (certificate_ids.size() == 1 && certificate_ids.front() == CaCertificateId::All) {

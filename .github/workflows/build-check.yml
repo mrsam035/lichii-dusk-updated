@@ -2,13 +2,9 @@ name: build-check
 
 on:
   pull_request:
-    branches: [nx2, dusk-v2, integrate/nx2-upstream-duskbloods]
+    branches: [nx2, dusk-v2]
   push:
-    branches:
-      - nx2
-      - dusk-v2
-      - 'integrate/**'
-      - duskbloods-runtime-fixes-2026-11-12
+    branches: [nx2, dusk-v2]
   workflow_dispatch:
 
 permissions:
@@ -87,6 +83,8 @@ jobs:
           modules: qtcharts
           cache: true
 
+      # Objects are keyed by content, so the newest cache of this branch or nx2 always helps;
+      # keying it on cpmfile.json threw the whole cache away whenever a dependency changed.
       - name: Restore dependencies and compiler objects
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
         with:
@@ -105,15 +103,15 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++-13 \
             -DENABLE_WERROR=ON \
             -DBUILD_TESTING=ON \
-            -DYUZU_TESTS=ON \
+            -DLICHII_TESTS=ON \
             -DENABLE_QT=ON \
             -DENABLE_QT_TRANSLATION=ON \
-            -DYUZU_CMD=ON \
-            -DYUZU_ROOM=OFF \
-            -DYUZU_ROOM_STANDALONE=OFF \
-            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DLICHII_CMD=ON \
+            -DLICHII_ROOM=OFF \
+            -DLICHII_ROOM_STANDALONE=OFF \
+            -DLICHII_USE_BUNDLED_QT=OFF \
             "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
-            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DLICHII_USE_BUNDLED_SDL3=ON \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
             -DENABLE_UPDATE_CHECKER=ON \
@@ -160,6 +158,8 @@ jobs:
     if: needs.changes.outputs.build == 'true'
     runs-on: windows-2022
     timeout-minutes: 120
+    # ccache rather than sccache: sccache has no direct mode for clang-cl, so every hit still ran the
+    # preprocessor and a 99% hit build took 8.5 minutes.
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 1G
@@ -175,6 +175,7 @@ jobs:
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
 
+      # The release job's compiler; ThinLTO is left to the release build to keep this job short.
       - name: Install LLVM
         shell: pwsh
         run: ./tools/windows/install-llvm.ps1
@@ -204,6 +205,7 @@ jobs:
         shell: pwsh
         run: ./tools/windows/install-vulkan-sdk.ps1
 
+      # Restore and save separately so a test failure still keeps the compiled objects.
       - name: Restore dependencies and compiler objects
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
         with:
@@ -213,14 +215,6 @@ jobs:
           key: clang-cl-ccache-qt683-${{ runner.os }}-${{ github.sha }}
           restore-keys: |
             clang-cl-ccache-qt683-${{ runner.os }}-
-
-      - name: Clear incomplete cached Boost source
-        shell: pwsh
-        run: |
-          $boost = '.cache/cpm/boost/1.92.0'
-          if (Test-Path $boost) {
-              Remove-Item -Recurse -Force $boost
-          }
 
       - name: Configure production and tests
         run: >-
@@ -234,18 +228,20 @@ jobs:
           "-DCMAKE_CXX_FLAGS=-DWIN32 -D_WINDOWS -EHsc -DNOMINMAX"
           -DENABLE_WERROR=ON
           -DBUILD_TESTING=ON
-          -DYUZU_TESTS=ON
+          -DLICHII_TESTS=ON
           -DENABLE_QT=ON
           -DENABLE_QT_TRANSLATION=ON
-          -DYUZU_CMD=ON
-          -DYUZU_ROOM=OFF
-          -DYUZU_ROOM_STANDALONE=OFF
-          -DYUZU_USE_BUNDLED_QT=OFF
-          -DYUZU_USE_BUNDLED_SDL3=ON
+          -DLICHII_CMD=ON
+          -DLICHII_ROOM=OFF
+          -DLICHII_ROOM_STANDALONE=OFF
+          -DLICHII_USE_BUNDLED_QT=OFF
+          -DLICHII_USE_BUNDLED_SDL3=ON
           -DENABLE_UPDATE_CHECKER=ON
           -DUSE_DISCORD_PRESENCE=OFF
           -DUSE_CCACHE=ON
 
+      # The install script pins clang-cl by checksum, so it identifies the compiler without hashing
+      # the binary on every call.
       - name: Build production and tests
         env:
           CCACHE_COMPILERCHECK: string:${{ hashFiles('tools/windows/install-llvm.ps1') }}
@@ -254,6 +250,8 @@ jobs:
           cmake --build build --parallel
           ccache --show-stats -v
 
+      # nxformat is linked statically: lichii.exe must not need an nxformat.dll, which Windows
+      # may refuse to load (Smart App Control, code integrity policies) or that may be missing.
       - name: Check lichii.exe does not import nxformat.dll
         run: |
           imports=$("$LLVM_ROOT/bin/llvm-readobj" --coff-imports build/bin/lichii.exe |
