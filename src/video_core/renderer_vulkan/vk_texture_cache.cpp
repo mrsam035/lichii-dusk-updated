@@ -3042,12 +3042,15 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     if (host_level_offset != 0) {
         flags |= VideoCommon::ImageFlagBits::TrimmedLevels;
     }
-    if (IsHugeAstcArray(runtime->device, info)) {
+    if (IsHugeAstcArray(runtime->device, info) && !Settings::DuskbloodsRenderAccuracy()) {
         flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
         flags |= VideoCommon::ImageFlagBits::Converted;
         flags |= VideoCommon::ImageFlagBits::CostlyLoad;
     } else if (IsPixelFormatASTC(info.format) && !runtime->device.IsOptimalAstcSupported()) {
-        switch (Settings::values.accelerate_astc.GetValue()) {
+        const auto astc_mode = Settings::DuskbloodsRenderAccuracy()
+                                  ? Settings::AstcDecodeMode::Cpu
+                                  : Settings::values.accelerate_astc.GetValue();
+        switch (astc_mode) {
         case Settings::AstcDecodeMode::Gpu:
             if (WillUseAcceleratedAstcDecode(runtime->device, info) ||
                 WillUseGpuBcnTranscode(runtime->device, info)) {
