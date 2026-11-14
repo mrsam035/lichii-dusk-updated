@@ -25,7 +25,6 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
-#include "video_core/nx2_dusk_accuracy.h"
 #include "common/time_zone.h"
 
 #if defined(__linux__ ) && defined(ARCHITECTURE_arm64)
@@ -203,32 +202,32 @@ void UpdateGPUAccuracy() {
 }
 
 bool IsGPULevelHigh() {
-    return VideoCommon::DuskAccuracy::Enabled() ||
+    return DuskbloodsRenderAccuracy() ||
            values.current_gpu_accuracy == GpuAccuracy::High;
 }
 
 bool IsDMALevelDefault() {
-    return !VideoCommon::DuskAccuracy::Enabled() &&
+    return !DuskbloodsRenderAccuracy() &&
            values.dma_accuracy.GetValue() == DmaAccuracy::Default;
 }
 
 bool IsDMALevelSafe() {
-    return VideoCommon::DuskAccuracy::Enabled() ||
+    return DuskbloodsRenderAccuracy() ||
            values.dma_accuracy.GetValue() == DmaAccuracy::Safe;
 }
 
 bool IsGPUFenceBehaviorDefault() {
-    return !VideoCommon::DuskAccuracy::Enabled() &&
+    return !DuskbloodsRenderAccuracy() &&
            values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Default;
 }
 
 bool IsGPUFenceBehaviorBalanced() {
-    return !VideoCommon::DuskAccuracy::Enabled() &&
+    return !DuskbloodsRenderAccuracy() &&
            values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Balanced;
 }
 
 bool IsGPUFenceBehaviorAccurate() {
-    return VideoCommon::DuskAccuracy::Enabled() ||
+    return DuskbloodsRenderAccuracy() ||
            values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Accurate;
 }
 
@@ -269,6 +268,7 @@ bool IsNceEnabled() {
 }
 
 static u64 current_program_id = 0;
+static std::atomic<bool> dusk_bloods_render_accuracy{false};
 
 void SetCurrentProgramID(u64 program_id) {
     current_program_id = program_id;
@@ -278,6 +278,14 @@ u64 GetCurrentProgramID() {
     return current_program_id;
 }
 
+void SetDuskbloodsRenderAccuracy(bool enabled) {
+    dusk_bloods_render_accuracy.store(enabled, std::memory_order_release);
+}
+
+bool DuskbloodsRenderAccuracy() {
+    return dusk_bloods_render_accuracy.load(std::memory_order_acquire);
+}
+
 static bool current_program_is_switch2 = false;
 
 void SetCurrentProgramIsSwitch2(bool is_switch2) {
@@ -285,7 +293,7 @@ void SetCurrentProgramIsSwitch2(bool is_switch2) {
 }
 
 bool ReactiveFlushing() {
-    return VideoCommon::DuskAccuracy::Enabled() || values.use_reactive_flushing.GetValue() ||
+    return DuskbloodsRenderAccuracy() || values.use_reactive_flushing.GetValue() ||
            values.force_reactive_flushing;
 }
 
