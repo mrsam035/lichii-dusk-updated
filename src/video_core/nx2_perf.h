@@ -58,7 +58,7 @@ inline bool Enabled() {
         const char* value = std::getenv("EDEN_NX2_PERF_OPT");
         return value == nullptr || value[0] != '0';
     }();
-    return !DuskAccuracy::Enabled() && enabled;
+    return !Settings::DuskbloodsRenderAccuracy() && enabled;
 }
 
 inline bool On(Opt opt) {
@@ -117,7 +117,7 @@ inline bool g_verify = VerifySwitchSet();
 /// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
 /// nx2_switches.txt, so a switch set only there takes effect from that point on.
 inline void ReadSwitch() {
-    g_verify = VerifySwitchSet() || DuskAccuracy::Enabled();
+    g_verify = VerifySwitchSet() || Settings::DuskbloodsRenderAccuracy();
 }
 
 inline bool Verify() {
