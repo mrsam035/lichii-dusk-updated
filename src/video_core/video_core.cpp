@@ -60,6 +60,7 @@ namespace VideoCore {
 void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
     Settings::UpdateRescalingInfo();
     VideoCommon::DuskAccuracy::ReadSwitch();
+    Settings::UpdateGPUAccuracy();
     VideoCommon::Nx2Profile::ReadSwitch();
     VideoCommon::StutterTrace::StartSession();
     Tegra::Nx2CmdPageDiag::ReadSwitch();
