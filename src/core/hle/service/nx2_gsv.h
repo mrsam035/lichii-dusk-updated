@@ -2037,7 +2037,8 @@ private:
         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
         // Ocarina waited ~12 ms a frame on its previous frame's fence here (#161).
         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
-        int frames_ahead = frames_ahead_setting;
+        // Ignore user/global overrides in the Duskbloods diagnostic: wait for this frame's fence.
+        int frames_ahead = Settings::DuskbloodsRenderAccuracy() ? 0 : frames_ahead_setting;
         const u64 app_program_id = system.GetApplicationProcessProgramID();
         if (frames_ahead == -1 && app_program_id == DonkeyKongBananzaProgramId) {
             frames_ahead = 0;
