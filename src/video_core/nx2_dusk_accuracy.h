@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <cstdlib>
 
 #include "common/common_types.h"
@@ -15,14 +14,12 @@
 namespace VideoCommon::DuskAccuracy {
 
 inline constexpr u64 DuskbloodsProgramId = 0x0400D1D02399A000ULL;
-inline std::atomic<bool> g_enabled{false};
-
 inline void ReadSwitch() {
     const char* value = std::getenv("EDEN_NX2_DUSK_ACCURACY");
     const bool requested = value == nullptr || value[0] != '0';
     const u64 program_id = Settings::GetCurrentProgramID();
     const bool enabled = requested && program_id == DuskbloodsProgramId;
-    g_enabled.store(enabled, std::memory_order_release);
+    Settings::SetDuskbloodsRenderAccuracy(enabled);
 
     if (enabled) {
         LOG_WARNING(HW_GPU,
@@ -35,7 +32,7 @@ inline void ReadSwitch() {
 }
 
 [[nodiscard]] inline bool Enabled() {
-    return g_enabled.load(std::memory_order_acquire);
+    return Settings::DuskbloodsRenderAccuracy();
 }
 
 } // namespace VideoCommon::DuskAccuracy
