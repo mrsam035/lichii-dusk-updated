@@ -765,7 +765,7 @@ struct OnlineRedirect {
                     start = end + 1;
                 }
             }
-            if (const char* text = std::getenv("EDEN_NX2_ONLINE_SERVER")) {
+            if (const char* text = std::getenv(OnlineServerEnvironmentVariable())) {
                 unsigned a, b, c, d, port;
                 if (std::sscanf(text, "%u.%u.%u.%u:%u", &a, &b, &c, &d, &port) == 5 && a < 256 &&
                     b < 256 && c < 256 && d < 256 && port < 65536) {
