@@ -25,6 +25,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/nx2_dusk_accuracy.h"
 #include "common/time_zone.h"
 
 #if defined(__linux__ ) && defined(ARCHITECTURE_arm64)
@@ -202,27 +203,33 @@ void UpdateGPUAccuracy() {
 }
 
 bool IsGPULevelHigh() {
-    return values.current_gpu_accuracy == GpuAccuracy::High;
+    return VideoCommon::DuskAccuracy::Enabled() ||
+           values.current_gpu_accuracy == GpuAccuracy::High;
 }
 
 bool IsDMALevelDefault() {
-    return values.dma_accuracy.GetValue() == DmaAccuracy::Default;
+    return !VideoCommon::DuskAccuracy::Enabled() &&
+           values.dma_accuracy.GetValue() == DmaAccuracy::Default;
 }
 
 bool IsDMALevelSafe() {
-    return values.dma_accuracy.GetValue() == DmaAccuracy::Safe;
+    return VideoCommon::DuskAccuracy::Enabled() ||
+           values.dma_accuracy.GetValue() == DmaAccuracy::Safe;
 }
 
 bool IsGPUFenceBehaviorDefault() {
-    return values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Default;
+    return !VideoCommon::DuskAccuracy::Enabled() &&
+           values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Default;
 }
 
 bool IsGPUFenceBehaviorBalanced() {
-    return values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Balanced;
+    return !VideoCommon::DuskAccuracy::Enabled() &&
+           values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Balanced;
 }
 
 bool IsGPUFenceBehaviorAccurate() {
-    return values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Accurate;
+    return VideoCommon::DuskAccuracy::Enabled() ||
+           values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Accurate;
 }
 
 bool IsFastmemEnabled() {
@@ -278,7 +285,8 @@ void SetCurrentProgramIsSwitch2(bool is_switch2) {
 }
 
 bool ReactiveFlushing() {
-    return values.use_reactive_flushing.GetValue() || values.force_reactive_flushing;
+    return VideoCommon::DuskAccuracy::Enabled() || values.use_reactive_flushing.GetValue() ||
+           values.force_reactive_flushing;
 }
 
 bool CurrentProgramIsSwitch2() {
