@@ -95,6 +95,9 @@ jobs:
           restore-keys: |
             lichii-windows-release-qt683-${{ runner.os }}-
 
+      - name: Remove broken cached Boost checkout
+        run: rm -rf .cache/cpm/boost
+
       - name: Configure Windows Release
         run: |
           set -euo pipefail
