@@ -198,7 +198,8 @@ bool GetDebugKnobAt(u8 i) {
 }
 
 void UpdateGPUAccuracy() {
-    values.current_gpu_accuracy = values.gpu_accuracy.GetValue();
+    values.current_gpu_accuracy = DuskbloodsRenderAccuracy() ? GpuAccuracy::High
+                                                             : values.gpu_accuracy.GetValue();
 }
 
 bool IsGPULevelHigh() {
