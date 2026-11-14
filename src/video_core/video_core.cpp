@@ -18,6 +18,7 @@
 #include "video_core/nx2_backx.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_download_trace.h"
+#include "video_core/nx2_dusk_accuracy.h"
 #include "video_core/nx2_list_grid.h"
 #include "video_core/nx2_list_macro_trace.h"
 #include "video_core/nx2_perf.h"
@@ -58,6 +59,7 @@ namespace VideoCore {
 /// @brief Creates an emulated GPU instance using the given system context.
 void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
     Settings::UpdateRescalingInfo();
+    VideoCommon::DuskAccuracy::ReadSwitch();
     VideoCommon::Nx2Profile::ReadSwitch();
     VideoCommon::StutterTrace::StartSession();
     Tegra::Nx2CmdPageDiag::ReadSwitch();
@@ -71,7 +73,10 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
 
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
     const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;
-    const bool use_async = Settings::values.use_asynchronous_gpu_emulation.GetValue();
+    // The Duskbloods experiment makes every GPU command wait for completion before the guest
+    // proceeds. This intentionally trades throughput for a simpler synchronization baseline.
+    const bool use_async = Settings::values.use_asynchronous_gpu_emulation.GetValue() &&
+                           !VideoCommon::DuskAccuracy::Enabled();
     gpu.emplace(system, use_async, use_nvdec);
     auto context = emu_window.CreateSharedContext();
     auto scope = context->Acquire();
