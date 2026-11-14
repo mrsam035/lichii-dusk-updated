@@ -167,7 +167,7 @@ jobs:
             Copy-Item "LICENSES" "$bin/LICENSES" -Recurse -Force
           }
           @'
-          Lichii 177 — Duskbloods integration build (Windows x64)
+          Lichii — Duskbloods integration build (Windows x64)
 
           1. Extract the entire package to a short, writable folder. Do not run the EXE from inside
              the ZIP and do not separate the DLLs from lichii.exe.
