@@ -2,7 +2,7 @@ name: windows-build
 
 on:
   pull_request:
-    branches: [dusk-v2, duskbloods-runtime-fixes-2026-11-12, integrate/nx2-upstream-duskbloods]
+    branches: [dusk-v2, duskbloods-runtime-fixes-2026-11-12, integrate/nx2-upstream-duskbloods, update/lichii-build-177-duskbloods]
     paths:
       - "src/**"
       - "CMakeLists.txt"
@@ -15,7 +15,7 @@ on:
       - "*.profdata"
       - ".github/workflows/windows-build.yml"
   push:
-    branches: [dusk-v2, duskbloods-runtime-fixes-2026-11-12, update/lichii-build-177-duskbloods]
+    branches: [dusk-v2, duskbloods-runtime-fixes-2026-11-12, update/lichii-build-177-duskbloods, exp/duskbloods-render-accuracy]
     paths:
       - "src/**"
       - "CMakeLists.txt"
