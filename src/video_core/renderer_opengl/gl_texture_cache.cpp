@@ -695,9 +695,9 @@ bool TextureCacheRuntime::HasNativeASTC() const noexcept {
 Image::Image(TextureCacheRuntime& runtime_, const VideoCommon::ImageInfo& info_, GPUVAddr gpu_addr_,
              VAddr cpu_addr_)
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), runtime{&runtime_} {
-    if (CanBeDecodedAsync(*runtime, info)) {
+    if (!Settings::DuskbloodsRenderAccuracy() && CanBeDecodedAsync(*runtime, info)) {
         flags |= ImageFlagBits::AsynchronousDecode;
-    } else if (CanBeAccelerated(*runtime, info)) {
+    } else if (!Settings::DuskbloodsRenderAccuracy() && CanBeAccelerated(*runtime, info)) {
         flags |= ImageFlagBits::AcceleratedUpload;
     }
     if (IsConverted(runtime->device, info.format, info.type)) {
