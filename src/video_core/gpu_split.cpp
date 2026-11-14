@@ -33,6 +33,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_dusk_accuracy.h"
 #include "video_core/nx2_back_idle_trace.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
@@ -148,6 +149,15 @@ void GpuSplit::CheckOwner(const char* where) {
 GpuSplit GpuSplit::instance;
 
 void GpuSplit::MaybeStart(Core::System& system_) {
+    // The diagnostic build deliberately runs the GPU in-order on one execution path.
+    // Drain an already-running back thread before returning ownership to the front.
+    if (DuskAccuracy::Enabled()) {
+        if (active) {
+            Drain();
+            Stop();
+        }
+        return;
+    }
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_SPLIT");
         return value != nullptr ? value[0] : '2';
