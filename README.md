@@ -51,6 +51,24 @@ This fork preserves the Duskbloods-specific integration from the original Lichii
 
 Some fixes from the original fork have since been implemented or superseded upstream. This project keeps the newer implementation where appropriate instead of blindly reapplying older patches.
 
+## Experimental Duskbloods render-accuracy build
+
+This branch contains a deliberately slow diagnostic mode intended to investigate intermittent visual noise, flicker, and unstable lighting in The Duskbloods Network Test. It is enabled by default for that title only; other games do not enter this mode.
+
+The experiment prioritizes deterministic GPU/memory behavior over frame rate:
+
+- Disables asynchronous GPU submission and the Switch 2 GPU split thread.
+- Forces high GPU accuracy, safe DMA behavior, accurate GPU-fence behavior, and reactive flushing for guest CPU reads.
+- Disables the NX2 performance shortcuts and enables the available verification/readback checks.
+- Uses conservative frame pacing and cache invalidation settings, and requests buffer readbacks even when they are expensive.
+- Keeps the existing `EDEN_NX2_TEMPORAL_WEIGHT=1` Duskbloods workaround.
+
+Expect substantially lower FPS, longer stalls, and more CPU/GPU waiting. That is intentional for this experiment. It does not promise to fix the visual issue: the first goal is to determine whether the artifact is caused by asynchronous execution, stale data, or memory/cache synchronization. If the image is still corrupted in this mode, the next investigation should focus on the specific shader, texture, render-target, or format-conversion path rather than performance tuning.
+
+The mode is title-ID gated and can be disabled with `EDEN_NX2_DUSK_ACCURACY=0`. A user configuration at `%APPDATA%\\lichii\\nx2_switches.txt` (or `$XDG_CONFIG_HOME/lichii/nx2_switches.txt`) takes precedence over the packaged switch file; make sure it does not override these diagnostic settings when testing this branch.
+
+This is an experimental branch stacked on the Lichii 177 Duskbloods integration PR. It is not the recommended everyday build and should not be merged into the stable branch until the rendering result has been tested in the game.
+
 ## Compatibility and troubleshooting
 
 Compatibility, performance, and rendering may vary depending on the game build, system files, hardware, graphics driver, and emulator settings. Visual issues, stuttering, or crashes may still occur; no specific performance level is guaranteed.
