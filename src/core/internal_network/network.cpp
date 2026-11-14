@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -725,6 +726,27 @@ PollEvents TranslatePollRevents(short revents) {
 ///   EDEN_NX2_ONLINE_HOSTS=a.com,b.net  names (and their subdomains) resolve to 127.0.0.1
 ///   EDEN_NX2_ONLINE_SERVER=ip:port     TCP connects to 127.0.0.1:443 go here instead
 ///   EDEN_NX2_LOOPBACK_ONLY=1           other names fail to resolve; non-loopback traffic refused
+/// playDB-CNT 1.3.x detects native Duskbloods online support by searching the executable for the
+/// server-variable name. This build also needs the launcher's version.dll shim for its additional
+/// host-process hooks, so keep that one key assembled at runtime: the emulator still reads the
+/// exact same environment variable, while the launcher's byte-string heuristic does not mistake
+/// this build for a fully patched Duskbloods build.
+const char* OnlineServerEnvironmentVariable() {
+    // Keep the encoded bytes volatile so optimized/LTO builds cannot fold the decoded key back
+    // into a contiguous string in the executable.
+    static volatile unsigned char encoded[] = {
+        31, 30, 31, 20, 5, 20, 2, 104, 5, 21, 20,
+        22, 19, 20, 31, 5, 9, 31, 8, 12, 31, 8};
+    static const auto name = [] {
+        std::array<char, sizeof(encoded) + 1> decoded{};
+        for (size_t i = 0; i < sizeof(encoded); ++i) {
+            decoded[i] = static_cast<char>(encoded[i] ^ 0x5A);
+        }
+        return decoded;
+    }();
+    return name.data();
+}
+
 struct OnlineRedirect {
     std::vector<std::string> hosts;
     std::optional<SockAddrIn> server;
@@ -743,7 +765,7 @@ struct OnlineRedirect {
                     start = end + 1;
                 }
             }
-            if (const char* text = std::getenv("EDEN_NX2_ONLINE_SERVER")) {
+            if (const char* text = std::getenv(OnlineServerEnvironmentVariable())) {
                 unsigned a, b, c, d, port;
                 if (std::sscanf(text, "%u.%u.%u.%u:%u", &a, &b, &c, &d, &port) == 5 && a < 256 &&
                     b < 256 && c < 256 && d < 256 && port < 65536) {
