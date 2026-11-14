@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "video_core/nx2_dusk_accuracy.h"
 
 // EXPERIMENT (not for nx2): GPU back-thread optimizations for Ocarina of Time.
 // split_overlap is quarantined. Frizti build: the options reviewed as exact rewrites are on by
@@ -57,7 +58,7 @@ inline bool Enabled() {
         const char* value = std::getenv("EDEN_NX2_PERF_OPT");
         return value == nullptr || value[0] != '0';
     }();
-    return enabled;
+    return !DuskAccuracy::Enabled() && enabled;
 }
 
 inline bool On(Opt opt) {
@@ -116,7 +117,7 @@ inline bool g_verify = VerifySwitchSet();
 /// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
 /// nx2_switches.txt, so a switch set only there takes effect from that point on.
 inline void ReadSwitch() {
-    g_verify = VerifySwitchSet();
+    g_verify = VerifySwitchSet() || DuskAccuracy::Enabled();
 }
 
 inline bool Verify() {
