@@ -18,6 +18,7 @@
 #include "video_core/nx2_backx.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_download_trace.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_dusk_accuracy.h"
 #include "video_core/nx2_list_grid.h"
 #include "video_core/nx2_list_macro_trace.h"
@@ -61,6 +62,8 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     Settings::UpdateRescalingInfo();
     VideoCommon::DuskAccuracy::ReadSwitch();
     Settings::UpdateGPUAccuracy();
+    // Disable state-delta reuse and asynchronous texture upload paths for a fully resolved draw.
+    VideoCommon::Nx2FastDraw::SetEnabled(!VideoCommon::DuskAccuracy::Enabled());
     VideoCommon::Nx2Profile::ReadSwitch();
     VideoCommon::StutterTrace::StartSession();
     Tegra::Nx2CmdPageDiag::ReadSwitch();
@@ -70,6 +73,8 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCore::AsyncReadback::ReadSwitch();
     VideoCommon::Nx2Perf::ReadSwitch();
     VideoCommon::BackX::ReadSwitch();
+    VideoCommon::BackX::g_verify =
+        VideoCommon::BackX::g_verify || VideoCommon::DuskAccuracy::Enabled();
     Core::GPUDirtyMemoryManager::count_collects = VideoCommon::BackX::g_verify;
 
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
