@@ -918,6 +918,9 @@ private:
     /// the native MME's DMA reads never touched those pages. Without them a fence costs ~1 us
     /// instead of ~5 and draw setup ~7% less. EDEN_NX2_BUFFER_DOWNLOADS=0/1 forces it.
     bool AsyncBufferDownloads() const {
+        if (Settings::DuskbloodsRenderAccuracy()) {
+            return true;
+        }
         static const int forced = [] {
             const char* value = std::getenv("EDEN_NX2_BUFFER_DOWNLOADS");
             return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
