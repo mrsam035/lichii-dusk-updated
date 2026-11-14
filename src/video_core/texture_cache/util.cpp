@@ -28,6 +28,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_dusk_accuracy.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/decode_bc.h"
 #include "video_core/texture_cache/format_lookup_table.h"
@@ -919,7 +920,7 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
             const std::span<u8> dst = output.subspan(host_offset);
             const std::span<const u8> src = input.subspan(guest_offset + guest_layer_offset);
-            if (!worker ||
+            if (!worker || DuskAccuracy::Enabled() ||
                 info.type != ImageType::e2D || info.num_samples != 1 ||
                 !worker->TryUnswizzle(
                     dst.first(host_bytes_per_layer), src.first(level_sizes[level]), 1U << bpp_log2,
