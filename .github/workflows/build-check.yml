@@ -216,6 +216,9 @@ jobs:
           restore-keys: |
             clang-cl-ccache-qt683-${{ runner.os }}-
 
+      - name: Re-fetch Windows CPM dependencies from a clean cache
+        run: rm -rf .cache/cpm
+
       - name: Configure production and tests
         run: >-
           cmake -S . -B build -G Ninja
