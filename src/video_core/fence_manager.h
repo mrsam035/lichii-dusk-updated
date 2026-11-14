@@ -267,10 +267,14 @@ private:
         // lock is taken once per burst instead of once per fence (the GPU thread, which holds
         // them for nearly every command, spun, slept and woke this thread for each one).
         // EDEN_NX2_FENCE_BATCH=0: one fence at a time (for comparisons).
-        static const size_t MaxBatch = [] {
-            const char* value = std::getenv("EDEN_NX2_FENCE_BATCH");
-            return value != nullptr && value[0] == '0' ? size_t{1} : size_t{64};
-        }();
+        static const size_t MaxBatch = Settings::DuskbloodsRenderAccuracy()
+                                           ? size_t{1}
+                                           : [] {
+                                                 const char* value = std::getenv("EDEN_NX2_FENCE_BATCH");
+                                                 return value != nullptr && value[0] == '0'
+                                                            ? size_t{1}
+                                                            : size_t{64};
+                                             }();
         struct Released {
             TFence fence;
             OperationList operations;
