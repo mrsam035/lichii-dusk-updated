@@ -74,9 +74,14 @@ inline std::atomic<bool> g_dynamic_vertex_input{};
     return g_enabled.load(std::memory_order_relaxed);
 }
 
+/// Explicit control for title-scoped diagnostic modes and tests.
+inline void SetEnabled(bool on) {
+    g_enabled.store(on, std::memory_order_release);
+}
+
 /// Tests only.
 inline void SetEnabledForTest(bool on) {
-    g_enabled.store(on, std::memory_order_relaxed);
+    SetEnabled(on);
 }
 
 /// EDEN_NX2_FAST_DRAW_VERIFY=1, read once.
