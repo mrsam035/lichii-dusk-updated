@@ -11,6 +11,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/settings.h"
 
 // Async read-back: a guest CPU read of GPU-written buffer memory (GPU::OnCPURead) has the GPU
 // thread submit the downloads and go on. The reading thread waits for that submission and writes
@@ -39,19 +40,25 @@ inline std::atomic<bool> g_dma_read_verify{std::getenv("EDEN_NX2_DMA_READ_VERIFY
 /// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
 /// nx2_switches.txt, so a switch set only there takes effect from that point on.
 inline void ReadSwitch() {
-    g_read_check_every.store(ParseReadCheck(std::getenv("EDEN_NX2_READ_CHECK")),
+    g_read_check_every.store(Settings::DuskbloodsRenderAccuracy()
+                                 ? 1
+                                 : ParseReadCheck(std::getenv("EDEN_NX2_READ_CHECK")),
                              std::memory_order_relaxed);
-    g_dma_read_verify.store(std::getenv("EDEN_NX2_DMA_READ_VERIFY") != nullptr,
+    g_dma_read_verify.store(Settings::DuskbloodsRenderAccuracy() ||
+                                std::getenv("EDEN_NX2_DMA_READ_VERIFY") != nullptr,
                             std::memory_order_relaxed);
 }
 
 /// EDEN_NX2_READ_CHECK: check 1 in this many read downloads, 0 for none.
 [[nodiscard]] inline u64 ReadCheckEvery() {
-    return g_read_check_every.load(std::memory_order_relaxed);
+    return Settings::DuskbloodsRenderAccuracy()
+               ? 1
+               : g_read_check_every.load(std::memory_order_relaxed);
 }
 
 [[nodiscard]] inline bool DmaReadVerify() {
-    return g_dma_read_verify.load(std::memory_order_relaxed);
+    return Settings::DuskbloodsRenderAccuracy() ||
+           g_dma_read_verify.load(std::memory_order_relaxed);
 }
 
 /// Who wrote a read download to guest memory, named by the read check's mismatch lines.
