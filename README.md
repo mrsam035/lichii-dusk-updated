@@ -65,7 +65,7 @@ The experiment prioritizes deterministic GPU/memory behavior over frame rate:
 
 Expect substantially lower FPS, longer stalls, and more CPU/GPU waiting. That is intentional for this experiment. It does not promise to fix the visual issue: the first goal is to determine whether the artifact is caused by asynchronous execution, stale data, or memory/cache synchronization. If the image is still corrupted in this mode, the next investigation should focus on the specific shader, texture, render-target, or format-conversion path rather than performance tuning.
 
-The mode is title-ID gated and can be disabled with `EDEN_NX2_DUSK_ACCURACY=0`. A user configuration at `%APPDATA%\\lichii\\nx2_switches.txt` (or `$XDG_CONFIG_HOME/lichii/nx2_switches.txt`) takes precedence over the packaged switch file; make sure it does not override these diagnostic settings when testing this branch.
+The mode is title-ID gated and can be disabled with `EDEN_NX2_DUSK_ACCURACY=0`. The core accuracy settings (same-frame fence waits, one-at-a-time fence release, buffer downloads, and readback checks) are forced in code for this title, so conflicting values in a user config cannot silently disable those parts. The user configuration at `%APPDATA%\\lichii\\nx2_switches.txt` (or `$XDG_CONFIG_HOME/lichii/nx2_switches.txt`) still takes precedence for other switches; keep `EDEN_NX2_TEMPORAL_WEIGHT=1` enabled and remove any conflicting override for it while testing.
 
 This is an experimental branch stacked on the Lichii 177 Duskbloods integration PR. It is not the recommended everyday build and should not be merged into the stable branch until the rendering result has been tested in the game.
 
