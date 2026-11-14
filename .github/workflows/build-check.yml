@@ -2,9 +2,9 @@ name: build-check
 
 on:
   pull_request:
-    branches: [nx2, dusk-v2]
+    branches: [nx2, dusk-v2, update/lichii-build-177-duskbloods]
   push:
-    branches: [nx2, dusk-v2]
+    branches: [nx2, dusk-v2, exp/duskbloods-render-accuracy]
   workflow_dispatch:
 
 permissions:
