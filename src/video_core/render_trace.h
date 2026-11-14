@@ -5,12 +5,13 @@
 #include <cstdlib>
 
 #include "common/common_types.h"
+#include "common/settings.h"
 
 namespace VideoCommon::RenderTrace {
 
 inline bool Enabled() {
-    static const bool enabled = std::getenv("EDEN_NX2_RENDER_TRACE") != nullptr;
-    return enabled;
+    static const bool requested = std::getenv("EDEN_NX2_RENDER_TRACE") != nullptr;
+    return requested || Settings::DuskbloodsRenderAccuracy();
 }
 
 inline bool SampleFrame(u64 frame) {
