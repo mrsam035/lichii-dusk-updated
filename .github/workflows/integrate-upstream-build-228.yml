@@ -47,7 +47,7 @@ jobs:
 
       - name: Open or update the Build 228 pull request
         env:
-          GH_TOKEN: \${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -56,14 +56,14 @@ jobs:
           body="$(cat <<'EOF'
           ## Lichii Build 228 integration for The Duskbloods
 
-          This PR advances the Duskbloods emulator from the official Lichii \`build-177\` base to the official \`build-228\` tag.
+          This PR advances the Duskbloods emulator from the official Lichii `build-177` base to the official `build-228` tag.
 
           ### Merge approach
-          - Merge the complete upstream \`build-228\` tag; this carries the full upstream code, dependency, renderer, shader, UI, and build-system changes rather than selectively copying files.
-          - Preserve Duskbloods-fork changes in overlapping hunks (\`-X ours\`) and use the Windows build to expose any API changes that need a careful manual port.
+          - Merge the complete upstream `build-228` tag; this carries the full upstream code, dependency, renderer, shader, UI, and build-system changes rather than selectively copying files.
+          - Preserve Duskbloods-fork changes in overlapping hunks (`-X ours`) and use the Windows build to expose any API changes that need a careful manual port.
           - Keep the playDB-CNT environment-variable lookup encoded at runtime so the launcher can still offer **Patch Lichii**.
           - Keep the Duskbloods runtime, BCAT, shader/Vulkan, memory/performance, and temporal-weight changes already present on the Build 177 branch.
-          - Do not bundle \`version.dll\`; playDB-CNT remains responsible for installing it.
+          - Do not bundle `version.dll`; playDB-CNT remains responsible for installing it.
 
           ### Validation
           A successful Windows CI build only proves compilation and packaging. It does not replace a real playDB-CNT patch-detection test or an in-game Duskbloods test. Keep this PR unmerged until those checks are completed.
@@ -80,7 +80,7 @@ jobs:
 
       - name: Dispatch the Windows x64 build
         env:
-          GH_TOKEN: \${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
