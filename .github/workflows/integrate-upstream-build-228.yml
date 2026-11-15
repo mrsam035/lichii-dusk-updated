@@ -12,6 +12,7 @@ permissions:
   contents: write
   pull-requests: write
   actions: write
+  workflows: write
 
 concurrency:
   group: integrate-upstream-build-228
