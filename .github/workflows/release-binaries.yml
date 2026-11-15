@@ -11,6 +11,7 @@ on:
     branches:
       - nx2-experimental
       - dusk-v2
+      - publish-build-177
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
@@ -737,11 +738,16 @@ jobs:
           ${pgo_note}
           EOF
 
+          if [[ "$GITHUB_REF_NAME" == "publish-build-177" ]]; then
+            release_title="Lichii Duskbloods Build 177"
+          else
+            release_title="Lichii Duskbloods Build 228"
+          fi
           gh release create "${tag}" dist/* \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --prerelease \
-            --title "Lichii ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+            --title "${release_title} (run ${GITHUB_RUN_NUMBER}, ${GITHUB_SHA::7})" \
             --notes-file notes.md
 
       # LICHII_BUILD_TAG is baked into every binary as build-<run number>, and the update checker
