@@ -12,7 +12,6 @@ permissions:
   contents: write
   pull-requests: write
   actions: write
-  workflows: write
 
 concurrency:
   group: integrate-upstream-build-228
@@ -44,6 +43,12 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git merge --no-ff --no-edit -X ours "$upstream_sha" \
             -m "Merge upstream Lichii build-228 into Duskbloods fork"
+          # Keep this fork's working CI definitions. GitHub's GITHUB_TOKEN is not allowed
+          # to push upstream workflow-file edits; these CI files are not emulator features.
+          git restore --source=HEAD^1 --staged --worktree .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
+          fi
           git push origin "HEAD:refs/heads/update/lichii-build-228-duskbloods"
 
       - name: Open or update the Build 228 pull request
