@@ -15,7 +15,7 @@ on:
       - "*.profdata"
       - ".github/workflows/windows-build.yml"
   push:
-    branches: [dusk-v2, duskbloods-runtime-fixes-2026-11-12]
+    branches: [dusk-v2, duskbloods-runtime-fixes-2026-11-12, update/lichii-build-177-duskbloods]
     paths:
       - "src/**"
       - "CMakeLists.txt"
@@ -30,7 +30,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: windows-build-${{ github.event.pull_request.number || github.ref }}
@@ -51,7 +51,35 @@ jobs:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge upstream Lichii build-228
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/zortos293/Lichii.git
+          git fetch --no-tags upstream refs/tags/build-228
+          upstream_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          echo "Merging official Lichii build-228: $upstream_sha"
+          before_merge="$(git rev-parse HEAD)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-ff --no-edit -X ours "$upstream_sha" \
+            -m "Merge upstream Lichii build-228 into Duskbloods fork"
+          after_merge="$(git rev-parse HEAD)"
+          if [[ "$after_merge" != "$before_merge" ]]; then
+            # Keep our working CI files. GITHUB_TOKEN cannot push changed workflow files.
+            git restore --source="$before_merge" --staged --worktree .github/workflows
+            if ! git diff --cached --quiet; then
+              git commit --amend --no-edit
+            fi
+            branch="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+            git push origin "HEAD:refs/heads/$branch"
+          else
+            echo "Upstream build-228 is already integrated; no merge commit or push is needed."
+          fi
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
@@ -102,14 +130,14 @@ jobs:
           cmake -S . -B build/release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
-            -DYUZU_TESTS=OFF \
+            -DLICHII_TESTS=OFF \
             -DENABLE_QT=ON \
-            -DYUZU_CMD=ON \
-            -DYUZU_ROOM=OFF \
-            -DYUZU_ROOM_STANDALONE=OFF \
-            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DLICHII_CMD=ON \
+            -DLICHII_ROOM=OFF \
+            -DLICHII_ROOM_STANDALONE=OFF \
+            -DLICHII_USE_BUNDLED_QT=OFF \
             -DENABLE_QT_TRANSLATION=ON \
-            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DLICHII_USE_BUNDLED_SDL3=ON \
             -DENABLE_UPDATE_CHECKER=ON \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON \
@@ -126,7 +154,7 @@ jobs:
         run: |
           set -euo pipefail
           ccache --zero-stats
-          cmake --build build/release --target yuzu yuzu-cmd lichii-updater --parallel
+          cmake --build build/release --target lichii lichii-cmd lichii-updater --parallel
           ccache --show-stats -v
           for exe in lichii.exe eden-cli.exe lichii-updater.exe; do
             test -s "build/release/bin/$exe"
