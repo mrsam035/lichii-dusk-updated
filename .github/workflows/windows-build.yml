@@ -30,7 +30,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: windows-build-${{ github.event.pull_request.number || github.ref }}
@@ -51,7 +51,28 @@ jobs:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          persist-credentials: true
+
+      - name: Merge upstream Lichii build-228
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/zortos293/Lichii.git
+          git fetch --no-tags upstream refs/tags/build-228
+          upstream_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          echo "Merging official Lichii build-228: $upstream_sha"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-ff --no-edit -X ours "$upstream_sha" \
+            -m "Merge upstream Lichii build-228 into Duskbloods fork"
+          # Keep our working CI files. GITHUB_TOKEN cannot push changed workflow files.
+          git restore --source=HEAD^1 --staged --worktree .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
+          fi
+          branch="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+          git push origin "HEAD:refs/heads/$branch"
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
