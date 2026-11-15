@@ -1113,6 +1113,13 @@ MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) cons
     return result;
 }
 
+boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedRangeUncached(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
+    GetSubmappedRangeImpl<true>(gpu_addr, size, result);
+    return result;
+}
+
 boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
 MemoryManager::GetSubmappedDeviceRangeUncached(GPUVAddr gpu_addr, std::size_t size) const {
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
