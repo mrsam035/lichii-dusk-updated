@@ -923,11 +923,15 @@ std::string IPv6AddressToString(IPv6Address ip_addr) {
     std::array<char, INET6_ADDRSTRLEN> buf = {};
     ASSERT(inet_ntop(AF_INET6, ip_addr.data(), buf.data(), sizeof(buf)) == buf.data());
     return std::string(buf.data());
+}
+
 std::string SockAddrToString(const SockAddrIn& addr) {
     if (addr.family == Domain::INET6) {
         return fmt::format("[{}]:{}", IPv6AddressToString(addr.ip6), addr.portno);
     }
     return fmt::format("{}:{}", IPv4AddressToString(addr.ip), addr.portno);
+}
+
 std::variant<std::vector<AddrInfo>, GetAddrInfoError> GetAddressInfo(
     const std::string& host, const std::optional<std::string>& service, Domain family) {
     const bool ipv6 = family == Domain::INET6;
