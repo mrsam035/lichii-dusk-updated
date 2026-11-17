@@ -55,19 +55,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Merge upstream Lichii build-228
+      - name: Merge upstream Lichii build-316
         shell: bash
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/zortos293/Lichii.git
-          git fetch --no-tags upstream refs/tags/build-228
+          git fetch --no-tags upstream refs/tags/build-316
           upstream_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
-          echo "Merging official Lichii build-228: $upstream_sha"
+          echo "Merging official Lichii build-316: $upstream_sha"
           before_merge="$(git rev-parse HEAD)"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git merge --no-ff --no-edit -X ours "$upstream_sha" \
-            -m "Merge upstream Lichii build-228 into Duskbloods fork"
+            -m "Merge upstream Lichii build-316 into Duskbloods fork"
           after_merge="$(git rev-parse HEAD)"
           if [[ "$after_merge" != "$before_merge" ]]; then
             # Keep our working CI files. GITHUB_TOKEN cannot push changed workflow files.
@@ -78,7 +78,7 @@ jobs:
             branch="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
             git push origin "HEAD:refs/heads/$branch"
           else
-            echo "Upstream build-228 is already integrated; no merge commit or push is needed."
+            echo "Upstream build-316 is already integrated; no merge commit or push is needed."
           fi
 
       - name: Set up MSVC
