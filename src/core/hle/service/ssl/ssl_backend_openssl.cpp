@@ -555,6 +555,8 @@ void OneTimeInit() {
 
     if (const auto bundle = Common::Net::FindSystemCaBundle(); !bundle.empty()) {
         SSL_CTX_load_verify_locations(ssl_ctx, bundle.c_str(), nullptr);
+    }
+
     OneTimeInitLogFile();
 
     if (!OneTimeInitBIO()) {
