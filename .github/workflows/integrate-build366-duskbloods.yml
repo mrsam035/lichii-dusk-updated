@@ -63,7 +63,11 @@ jobs:
                   text=True, capture_output=True
               )
               if result.returncode not in (0, 1):
-                  raise RuntimeError(f"git merge-file failed for {path}: {result.stderr}")
+                  raise RuntimeError(
+                      f"git merge-file failed for {path}: rc={result.returncode}, "
+                      f"stderr={result.stderr!r}, stdout_head={result.stdout[:1200]!r}"
+                  )
+              print(f"three-way merge {path}: rc={result.returncode}, output={len(result.stdout)} bytes")
               return result.stdout, upstream, dusk
 
           marker = re.compile(
