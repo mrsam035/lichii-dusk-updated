@@ -1,0 +1,303 @@
+name: integrate-build366-duskbloods
+
+on:
+  push:
+    branches: [update/build366-duskbloods-final]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: integrate-build366-duskbloods
+  cancel-in-progress: false
+
+jobs:
+  integrate:
+    if: ${{ !contains(github.event.head_commit.message, '[integrated]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out candidate branch
+        uses: actions/checkout@v5
+        with:
+          ref: update/build366-duskbloods-final
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge Dusk v4 and preserve the project's Duskbloods integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add dusk https://github.com/Mr-Tb/lichii-dusk.git
+          git fetch --no-tags dusk refs/heads/dusk-v4
+          git merge --no-commit --no-ff FETCH_HEAD || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          def stage(stage_no, path):
+              return subprocess.check_output(["git", "show", f":{stage_no}:{path}"], text=True)
+
+          def merge_file(path):
+              base = stage(1, path)
+              upstream = stage(2, path)
+              dusk = stage(3, path)
+              temp = Path("/tmp/merge-input")
+              temp.mkdir(exist_ok=True)
+              (temp / "base").write_text(base)
+              (temp / "upstream").write_text(upstream)
+              (temp / "dusk").write_text(dusk)
+              result = subprocess.run(
+                  ["git", "merge-file", "-p", "-L", "upstream", "-L", "base", "-L", "dusk",
+                   str(temp / "upstream"), str(temp / "base"), str(temp / "dusk")],
+                  text=True, capture_output=True
+              )
+              if result.returncode not in (0, 1):
+                  raise RuntimeError(f"git merge-file failed for {path}: {result.stderr}")
+              return result.stdout, upstream, dusk
+
+          marker = re.compile(
+              r"^<<<<<<<[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n?",
+              re.MULTILINE | re.DOTALL
+          )
+
+          def take_dusk(text):
+              return marker.sub(lambda m: m.group(2), text)
+
+          # Upstream's newer IPv4-mapped IPv6 target conversion is kept; Dusk v4 supplies the
+          # launcher environment, local CA, host matching, and IPv6 loopback handling.
+          path = "src/core/internal_network/local_redirect.cpp"
+          upstream = stage(2, path)
+          dusk = stage(3, path)
+          def function_block(source):
+              start = source.index("SockAddrIn ConnectTarget(")
+              end = source.index("\n}\n\nbool Allowed", start) + 2
+              return start, end, source[start:end]
+          us, ue, up_func = function_block(upstream)
+          ds, de, _ = function_block(dusk)
+          merged = dusk[:ds] + up_func + dusk[de:]
+          # Keep the playDB-CNT 1.3.x compatibility heuristic: the launcher must still see that
+          # its version.dll shim is required. Decode only the server key at runtime.
+          key_helper = r'''
+          // playDB-CNT 1.3.x detects the patched native redirect by scanning the executable for
+          // this key. Keep it assembled at runtime so its version.dll shim remains enabled.
+          const char* OnlineServerEnvironmentVariable() {
+              static volatile unsigned char encoded[] = {
+                  31, 30, 31, 20, 5, 20, 2, 104, 5, 21, 20,
+                  22, 19, 20, 31, 5, 9, 31, 8, 12, 31, 8};
+              static const auto name = [] {
+                  std::array<char, sizeof(encoded) + 1> decoded{};
+                  for (size_t i = 0; i < sizeof(encoded); ++i) {
+                      decoded[i] = static_cast<char>(encoded[i] ^ 0x5A);
+                  }
+                  return decoded;
+              }();
+              return name.data();
+          }
+          '''
+          insert_at = merged.index("void Configure()")
+          merged = merged[:insert_at] + key_helper + "\n" + merged[insert_at:]
+          merged = merged.replace('env("EDEN_NX2_ONLINE_SERVER")',
+                                  'env(OnlineServerEnvironmentVariable())')
+          if merged.count("OnlineServerEnvironmentVariable()") < 3:
+              raise RuntimeError("failed to obfuscate the playDB-CNT server environment key")
+          Path(path).write_text(merged)
+
+          # Keep upstream's new startup/What's New declarations and Dusk's live upscaler status UI.
+          path = "src/lichii/main_window.h"
+          merged, _, _ = merge_file(path)
+          merged = take_dusk(merged)
+          Path(path).write_text(merged)
+
+          # Dusk's FSR 3.1 tracking/prepass path and conditional DLSS-pass suppression are the
+          # game-specific implementation; upstream's surrounding code is auto-merged.
+          path = "src/video_core/engines/kepler_compute.cpp"
+          merged, _, _ = merge_file(path)
+          Path(path).write_text(take_dusk(merged))
+
+          # Keep the upstream query/transform-feedback work and Dusk's draw_list/draw_skip hooks.
+          path = "src/video_core/renderer_vulkan/vk_rasterizer.cpp"
+          merged, _, _ = merge_file(path)
+          Path(path).write_text(take_dusk(merged))
+
+          # FSR depth validation accepts the common upstream DLSS formats and Dusk's actual
+          # Duskbloods prepass formats. Retain the Dusk max-render-size argument and upstream report.
+          path = "src/video_core/renderer_vulkan/vk_texture_cache.cpp"
+          merged, _, _ = merge_file(path)
+          replacements = [
+              '''    // The Duskbloods prepass can supply these depth formats in addition to the generic DLSS set.
+              const auto depth_format_ok = [](PixelFormat format) {
+                  return VideoCommon::DlssContract::IsUpscalerDepthFormat(format) ||
+                         format == PixelFormat::D32_FLOAT || format == PixelFormat::D24_UNORM_S8_UINT ||
+                         format == PixelFormat::X8_D24_UNORM || format == PixelFormat::D32_FLOAT_S8_UINT;
+              };
+              if (use_history && depth && (!depth_format_ok(depth->format) || !plain(*depth) ||
+                                           !fits(*depth, render_size) || !same_size(*depth))) {''',
+              '''                                 jitter, motion_scale, max_render_size)) {
+                  report(UsesNvidiaDlss() ? "NVIDIA DLSS" : "FSR 3.1", "all inputs present");'''
+          ]
+          index = 0
+          def replace_vk_tc(match):
+              global index
+              value = replacements[index]
+              index += 1
+              return value
+          merged = marker.sub(replace_vk_tc, merged)
+          if index != 2:
+              raise RuntimeError(f"expected 2 vk_texture_cache conflicts, resolved {index}")
+          Path(path).write_text(merged)
+
+          # The actual Dusk depth target formats extend, rather than replace, the newer upstream
+          # DLSS format contract. Keep the image-format captured from the real Dusk target.
+          path = "src/video_core/texture_cache/texture_cache.h"
+          merged, _, _ = merge_file(path)
+          replacement = '''            // A tracked Duskbloods depth target can also use the formats measured in v31.
+              const PixelFormat depth_format = slot_images[depth_id].info.format;
+              const bool depth_format_ok =
+                  VideoCommon::DlssContract::IsUpscalerDepthFormat(depth_format) ||
+                  (depth_target && (depth_format == PixelFormat::D24_UNORM_S8_UINT ||
+                                    depth_format == PixelFormat::X8_D24_UNORM ||
+                                    depth_format == PixelFormat::D32_FLOAT_S8_UINT));
+              if (slot_images[depth_id].info.num_samples != 1 || !depth_format_ok) {'''
+          merged, n = marker.subn(lambda m: replacement, merged)
+          if n != 1:
+              raise RuntimeError(f"expected 1 texture_cache.h conflict, resolved {n}")
+          Path(path).write_text(merged)
+
+          # Use upstream's map-time tiling metadata and verification, plus Dusk's opt-in per-site
+          # unswizzle diagnostic switch.
+          path = "src/video_core/texture_cache/util.cpp"
+          merged, _, _ = merge_file(path)
+          replacement = '''                    stride_alignment, info.native_tiling,
+                    Nx2Perf::Verify() || Nx2Perf::Slow(Nx2Perf::Site::Unswizzle))) {'''
+          merged, n = marker.subn(lambda m: replacement, merged)
+          if n != 1:
+              raise RuntimeError(f"expected 1 texture_cache/util.cpp conflict, resolved {n}")
+          Path(path).write_text(merged)
+
+          # Carry the project's temporal-weight workaround into the new package defaults.
+          path = Path("dist/nx2_switches.txt")
+          switches = path.read_text()
+          if "EDEN_NX2_TEMPORAL_WEIGHT=1" not in switches:
+              anchor = "# --- Workarounds / Debug ---"
+              if anchor not in switches:
+                  raise RuntimeError("could not locate nx2_switches workaround section")
+              switches = switches.replace(
+                  anchor,
+                  "# Duskbloods still-camera blur/shake workaround from this fork.\n"
+                  "EDEN_NX2_TEMPORAL_WEIGHT=1\n\n" + anchor, 1
+              )
+          path.write_text(switches)
+
+          # Keep the existing host OpenSSL CA fallback in addition to Dusk's guest CertStore CA.
+          path = Path("src/core/hle/service/ssl/ssl_backend_openssl.cpp")
+          ssl = path.read_text()
+          if "EDEN_NX2_ONLINE_CA" not in ssl:
+              needle = '''    if (const auto bundle = Common::Net::FindSystemCaBundle(); !bundle.empty()) {
+          SSL_CTX_load_verify_locations(ssl_ctx, bundle.c_str(), nullptr);
+      }
+
+      OneTimeInitLogFile();'''
+              if needle not in ssl:
+                  raise RuntimeError("could not find system CA bundle insertion point in OpenSSL backend")
+              block = '''    if (const char* ca_path = std::getenv("EDEN_NX2_ONLINE_CA"); ca_path && *ca_path) {
+          bool added = false;
+          if (std::FILE* file = std::fopen(ca_path, "rb")) {
+              if (X509* ca = d2i_X509_fp(file, nullptr)) {
+                  added = X509_STORE_add_cert(SSL_CTX_get_cert_store(ssl_ctx), ca) == 1;
+                  X509_free(ca);
+              }
+              std::fclose(file);
+          }
+          LOG_INFO(Service_SSL, "Online test CA {} {}", ca_path,
+                   added ? "trusted" : "could not be loaded");
+      }
+
+      OneTimeInitLogFile();'''
+              ssl = ssl.replace(needle, needle.replace("      OneTimeInitLogFile();", block), 1)
+              if "#include <cstdio>" not in ssl:
+                  pos = ssl.find("#include")
+                  ssl = ssl[:pos] + "#include <cstdio>\n#include <cstdlib>\n" + ssl[pos:]
+          path.write_text(ssl)
+
+          # The newer Dusk v4 patch manager supersedes the older Build 228 copy with updated
+          # verified offsets, newer built-ins, and the same game-specific patch facilities.
+          # Update the public project description so it no longer claims to be based on Build 228.
+          readme = Path("README.md")
+          if readme.exists():
+              body = readme.read_text()
+              body = body.replace("upstream **Lichii build 341**",
+                                  "upstream **Lichii Build 366 and later nx2 changes**")
+              body = body.replace("upstream **Lichii build 228**",
+                                  "upstream **Lichii Build 366 and later nx2 changes**")
+              readme.write_text(body)
+
+          PY
+
+          git rm -f .github/workflows/audit-dusk-v4-merge.yml 2>/dev/null || true
+          git rm -f .github/workflows/audit-user-branch-merge.yml 2>/dev/null || true
+          git rm -f tools/merge-audit-trigger.txt 2>/dev/null || true
+          rm -rf merge-conflicts merge-audit.txt
+
+          # Adapt upstream packaging to build only the requested standard Windows x64 and Linux
+          # x86_64 outputs. A push to this candidate branch must never publish an automatic Release.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path(".github/workflows/release-binaries.yml")
+          text = path.read_text()
+          if "update/build366-duskbloods-final" not in text:
+              text = text.replace(
+                  "      - nx2-experimental\n",
+                  "      - nx2-experimental\n      - update/build366-duskbloods-final\n", 1
+              )
+          text = text.replace(
+              "if: github.event_name == 'push' || inputs.publish_release",
+              "if: (github.event_name == 'push' && github.ref_name == 'nx2-experimental') || inputs.publish_release"
+          )
+          text, count = re.subn(
+              r"      matrix:\n        include:\n.*?(?=\n\n    steps:)",
+              "      matrix:\n        include:\n"
+              "          - platform: linux-x86_64\n"
+              "            runner: ubuntu-24.04\n"
+              "          - platform: windows-x86_64\n"
+              "            runner: windows-2022",
+              text, count=1, flags=re.S
+          )
+          if count != 1:
+              raise RuntimeError("could not restrict release-binaries matrix to Linux and Windows standard")
+          path.write_text(text)
+
+          path = Path(".github/workflows/build-check.yml")
+          text = path.read_text()
+          text = text.replace(
+              "branches: [nx2, 'capy/nce-*']",
+              "branches: [nx2, dusk-v2, 'capy/nce-*']"
+          )
+          path.write_text(text)
+          PY
+
+          # There must be no unresolved merge stages or conflict markers in the candidate.
+          if git diff --name-only --diff-filter=U | grep .; then
+            echo "::error::unresolved merge conflicts remain"
+            exit 1
+          fi
+          if grep -R -nE '^(<<<<<<<|=======|>>>>>>>)' src .github README.md; then
+            echo "::error::merge markers remain in source files"
+            exit 1
+          fi
+          git add -A
+          git commit -m "merge: Lichii 366+ with Duskbloods v4 [integrated]"
+          git push origin HEAD:update/build366-duskbloods-final
+
+      - name: Record integrated revision
+        if: always()
+        run: |
+          echo "Integration attempt finished for $GITHUB_SHA"
+          git status --short
