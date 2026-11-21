@@ -5,7 +5,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [nx2, dusk-v2, 'capy/nce-*']
   push:
-    branches: [nx2]
+    branches: [nx2, update/build366-duskbloods-final]
   workflow_dispatch:
 
 permissions:
