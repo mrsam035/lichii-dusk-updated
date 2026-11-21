@@ -207,16 +207,10 @@ jobs:
           path = Path("src/core/hle/service/ssl/ssl_backend_openssl.cpp")
           ssl = path.read_text()
           if "EDEN_NX2_ONLINE_CA" not in ssl:
-              needle = (
-                  "    if (const auto bundle = Common::Net::FindSystemCaBundle(); !bundle.empty()) {\\n"
-                  "        SSL_CTX_load_verify_locations(ssl_ctx, bundle.c_str(), nullptr);\\n"
-                  "    }\\n"
-                  "\\n"
-                  "    OneTimeInitLogFile();"
-              )
+              needle = "SSL_CTX_load_verify_locations(ssl_ctx, bundle.c_str(), nullptr);"
               if needle not in ssl:
-                  raise RuntimeError("could not find system CA bundle insertion point in OpenSSL backend")
-              block = "\\n".join([
+                  raise RuntimeError("could not find system CA loading call in OpenSSL backend")
+              block = chr(10).join([
                   '    if (const char* ca_path = std::getenv("EDEN_NX2_ONLINE_CA"); ca_path && *ca_path) {',
                   '        bool added = false;',
                   '        if (std::FILE* file = std::fopen(ca_path, "rb")) {',
@@ -228,14 +222,15 @@ jobs:
                   '        }',
                   '        LOG_INFO(Service_SSL, "Online test CA {} {}", ca_path,',
                   '                 added ? "trusted" : "could not be loaded");',
-                  '    }',
-                  '',
-                  '    OneTimeInitLogFile();',
+                  '    }'
               ])
-              ssl = ssl.replace(needle, block, 1)
+              ssl = ssl.replace(needle, needle + chr(10) + chr(10) + block, 1)
           if "#include <cstdio>" not in ssl:
-                  pos = ssl.find("#include")
-                  ssl = ssl[:pos] + "#include <cstdio>\n#include <cstdlib>\n" + ssl[pos:]
+              pos = ssl.find("#include")
+              ssl = ssl[:pos] + "#include <cstdio>\\n" + ssl[pos:]
+          if "#include <cstdlib>" not in ssl:
+              pos = ssl.find("#include")
+              ssl = ssl[:pos] + "#include <cstdlib>\\n" + ssl[pos:]
           path.write_text(ssl)
 
           # The newer Dusk v4 patch manager supersedes the older Build 228 copy with updated
