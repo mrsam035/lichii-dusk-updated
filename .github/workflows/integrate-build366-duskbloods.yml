@@ -203,29 +203,33 @@ jobs:
           path = Path("src/core/hle/service/ssl/ssl_backend_openssl.cpp")
           ssl = path.read_text()
           if "EDEN_NX2_ONLINE_CA" not in ssl:
-              needle = '''    if (const auto bundle = Common::Net::FindSystemCaBundle(); !bundle.empty()) {
-          SSL_CTX_load_verify_locations(ssl_ctx, bundle.c_str(), nullptr);
-      }
-
-      OneTimeInitLogFile();'''
+              needle = (
+                  "    if (const auto bundle = Common::Net::FindSystemCaBundle(); !bundle.empty()) {\\n"
+                  "        SSL_CTX_load_verify_locations(ssl_ctx, bundle.c_str(), nullptr);\\n"
+                  "    }\\n"
+                  "\\n"
+                  "    OneTimeInitLogFile();"
+              )
               if needle not in ssl:
                   raise RuntimeError("could not find system CA bundle insertion point in OpenSSL backend")
-              block = '''    if (const char* ca_path = std::getenv("EDEN_NX2_ONLINE_CA"); ca_path && *ca_path) {
-          bool added = false;
-          if (std::FILE* file = std::fopen(ca_path, "rb")) {
-              if (X509* ca = d2i_X509_fp(file, nullptr)) {
-                  added = X509_STORE_add_cert(SSL_CTX_get_cert_store(ssl_ctx), ca) == 1;
-                  X509_free(ca);
-              }
-              std::fclose(file);
-          }
-          LOG_INFO(Service_SSL, "Online test CA {} {}", ca_path,
-                   added ? "trusted" : "could not be loaded");
-      }
-
-      OneTimeInitLogFile();'''
-              ssl = ssl.replace(needle, needle.replace("      OneTimeInitLogFile();", block), 1)
-              if "#include <cstdio>" not in ssl:
+              block = (
+                  "    if (const char* ca_path = std::getenv(\\"EDEN_NX2_ONLINE_CA\\"); ca_path && *ca_path) {\\n"
+                  "        bool added = false;\\n"
+                  "        if (std::FILE* file = std::fopen(ca_path, \\"rb\\")) {\\n"
+                  "            if (X509* ca = d2i_X509_fp(file, nullptr)) {\\n"
+                  "                added = X509_STORE_add_cert(SSL_CTX_get_cert_store(ssl_ctx), ca) == 1;\\n"
+                  "                X509_free(ca);\\n"
+                  "            }\\n"
+                  "            std::fclose(file);\\n"
+                  "        }\\n"
+                  "        LOG_INFO(Service_SSL, \\"Online test CA {} {}\\", ca_path,\\n"
+                  "                 added ? \\"trusted\\" : \\"could not be loaded\\");\\n"
+                  "    }\\n"
+                  "\\n"
+                  "    OneTimeInitLogFile();"
+              )
+              ssl = ssl.replace(needle, block, 1)
+          if "#include <cstdio>" not in ssl:
                   pos = ssl.find("#include")
                   ssl = ssl[:pos] + "#include <cstdio>\n#include <cstdlib>\n" + ssl[pos:]
           path.write_text(ssl)
