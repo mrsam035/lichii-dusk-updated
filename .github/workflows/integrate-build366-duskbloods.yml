@@ -291,16 +291,18 @@ jobs:
           path.write_text(text)
           PY
 
+          # Stage the manually resolved files first; Git otherwise still lists their old index
+          # stages as unmerged even though the working-tree content is resolved.
+          git add -A
           # There must be no unresolved merge stages or conflict markers in the candidate.
-          if git diff --name-only --diff-filter=U | grep .; then
-            echo "::error::unresolved merge conflicts remain"
+          if git ls-files -u | grep .; then
+            echo "::error::unresolved merge stages remain"
             exit 1
           fi
           if grep -R -nE '^(<<<<<<<|=======|>>>>>>>)' src .github README.md; then
             echo "::error::merge markers remain in source files"
             exit 1
           fi
-          git add -A
           git commit -m "merge: Lichii 366+ with Duskbloods v4 [integrated]"
           git push origin HEAD:update/build366-duskbloods-final
 
