@@ -36,7 +36,7 @@ Put `Play.Duskbloods.exe` in the same folder as `lichii.exe`, then follow [Launc
 
 ## What's new in v4
 
-- **Rebased on the newest zortos293/Lichii nx2** (after build 341; v3 was build 177): hundreds of upstream fixes, and fewer shader freezes (a draw whose shader is still building waits at most 8 ms, then shows a frame later).
+- **Rebased on the newest zortos293/Lichii nx2** (Build 366 and the current nx2 branch, including post-366 upstream updates; v3 was build 177): hundreds of upstream fixes, and fewer shader freezes (a draw whose shader is still building waits at most 8 ms, then shows a frame later).
 - **Much faster lighting:** the game's lighting shader, the heaviest part of each frame, now reads its light data directly instead of searching every buffer for it. Our own fix, for every GPU. At 2x on an RTX 3060: **30.4 → 39.4 fps**.
 - **Shorter GPU waits:** the texture cache writes back at most one GPU-drawn image per frame with a full GPU wait; the rest wait a frame. **39.5 → 43.3 fps** in game, better 1% lows, and less texture churn when memory runs low.
 - **Online fix** for the newer upstream base: its IPv6 connections now reach the launcher's servers (error 2321-4992 otherwise).
