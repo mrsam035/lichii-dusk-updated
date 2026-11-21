@@ -13,7 +13,6 @@ concurrency:
 
 jobs:
   integrate:
-    if: ${{ !contains(github.event.head_commit.message, '[integrated]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -25,9 +24,15 @@ jobs:
           persist-credentials: true
 
       - name: Merge Dusk v4 and preserve the project's Duskbloods integration
+        env:
+          EVENT_MESSAGE: ${{ github.event.head_commit.message }}
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$EVENT_MESSAGE" == *"[integrated]"* ]]; then
+            echo "This is the follow-up push of the merge commit; nothing to integrate."
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add dusk https://github.com/Mr-Tb/lichii-dusk.git
