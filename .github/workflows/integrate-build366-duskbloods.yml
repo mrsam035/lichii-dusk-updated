@@ -62,12 +62,12 @@ jobs:
                    str(temp / "upstream"), str(temp / "base"), str(temp / "dusk")],
                   text=True, capture_output=True
               )
-              if result.returncode not in (0, 1):
+              if result.returncode != 0 and not re.search(r"^<<<<<<<", result.stdout, re.MULTILINE):
                   raise RuntimeError(
                       f"git merge-file failed for {path}: rc={result.returncode}, "
                       f"stderr={result.stderr!r}, stdout_head={result.stdout[:1200]!r}"
                   )
-              print(f"three-way merge {path}: rc={result.returncode}, output={len(result.stdout)} bytes")
+              print(f"three-way merge {path}: conflicts={result.returncode}, output={len(result.stdout)} bytes")
               return result.stdout, upstream, dusk
 
           marker = re.compile(
