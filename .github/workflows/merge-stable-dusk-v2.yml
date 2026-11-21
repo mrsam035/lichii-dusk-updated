@@ -1,0 +1,73 @@
+name: merge-stable-dusk-v2
+
+on:
+  push:
+    branches: [update/build366-duskbloods-final]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: merge-stable-dusk-v2
+  cancel-in-progress: false
+
+jobs:
+  integrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: update/build366-duskbloods-final
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Merge the project's stable Duskbloods history
+        env:
+          EVENT_MESSAGE: ${{ github.event.head_commit.message }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_MESSAGE" == *"[stable-merged]"* ]]; then
+            echo "Stable Duskbloods history is already merged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          before_merge="$(git rev-parse HEAD)"
+          git fetch --no-tags origin refs/heads/dusk-v2:refs/remotes/origin/dusk-v2
+          if git merge-base --is-ancestor origin/dusk-v2 HEAD; then
+            echo "Stable branch is already an ancestor; no merge needed."
+            exit 0
+          fi
+          git merge --no-commit --no-ff origin/dusk-v2 || true
+          conflicts="$(git diff --name-only --diff-filter=U || true)"
+          echo "Resolving $(printf '%s\n' "$conflicts" | sed '/^$/d' | wc -l) overlap files."
+          if [ -n "$conflicts" ]; then
+            while IFS= read -r file; do
+              [ -n "$file" ] || continue
+              # The candidate side is Lichii 366+ plus Dusk v4. For the conflicting areas,
+              # it carries the newer implementations; stable-only changes outside these
+              # overlaps are kept by the normal three-way merge.
+              git checkout --ours -- "$file"
+              git add "$file"
+            done <<< "$conflicts"
+          fi
+          # Keep the current, explicitly restricted two-target CI configuration. It must not
+          # import the legacy build-228 Windows-only workflow or create extra artifacts.
+          git restore --source="$before_merge" --staged --worktree .github/workflows
+          git rm -f .github/workflows/windows-build.yml 2>/dev/null || true
+          git add -A
+          if git ls-files -u | grep .; then
+            echo "::error::unresolved merge stages remain"
+            exit 1
+          fi
+          if grep -R -nE '^(<<<<<<<|=======|>>>>>>>)' src .github README.md; then
+            echo "::error::merge markers remain"
+            exit 1
+          fi
+          # The merged candidate must retain the two user-critical defaults.
+          grep -q '^EDEN_NX2_TEMPORAL_WEIGHT=1$' dist/nx2_switches.txt
+          grep -q 'EDEN_NX2_ONLINE_CA' src/core/hle/service/ssl/ssl_backend_openssl.cpp
+          grep -q 'OnlineServerEnvironmentVariable' src/core/internal_network/local_redirect.cpp
+          git commit -m "merge: preserve stable Duskbloods history on Lichii 366+ [stable-merged]"
+          git push origin HEAD:update/build366-duskbloods-final
