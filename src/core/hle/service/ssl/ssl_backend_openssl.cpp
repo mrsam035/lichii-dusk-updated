@@ -3,7 +3,9 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>\n#include <cstdio>\n#include <mutex>
+#include <cstdlib>
+#include <cstdio>
+#include <mutex>
 #include <vector>
 
 #include <openssl/bio.h>
@@ -541,6 +543,7 @@ void OneTimeInit() {
 
     if (const auto bundle = Common::Net::FindSystemCaBundle(); !bundle.empty()) {
         SSL_CTX_load_verify_locations(ssl_ctx, bundle.c_str(), nullptr);
+    }
 
     if (const char* ca_path = std::getenv("EDEN_NX2_ONLINE_CA"); ca_path && *ca_path) {
         bool added = false;
@@ -553,7 +556,6 @@ void OneTimeInit() {
         }
         LOG_INFO(Service_SSL, "Online test CA {} {}", ca_path,
                  added ? "trusted" : "could not be loaded");
-    }
     }
 
     OneTimeInitLogFile();
