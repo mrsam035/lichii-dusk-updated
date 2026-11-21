@@ -2,7 +2,7 @@ name: build-check
 
 on:
   pull_request:
-    branches: [nx2, 'capy/nce-*']
+    branches: [nx2, dusk-v2, 'capy/nce-*']
   push:
     branches: [nx2]
   workflow_dispatch:
