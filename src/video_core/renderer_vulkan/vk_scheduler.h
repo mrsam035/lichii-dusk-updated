@@ -29,6 +29,8 @@
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
+#include "video_core/renderer_vulkan/pass_label.h"
+#include "video_core/renderer_vulkan/frame_pacer.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -99,6 +101,39 @@ public:
     }
     /// Host GPU busy time of the last sampled frame, nullopt when none was taken in 3 s.
     [[nodiscard]] std::optional<double> GpuBusyMs() const;
+
+    /// GPU time around a temporal upscaler: timestamps at its start and end and at each present.
+    enum class GpuMark : u8 { UpscaleBegin, UpscaleEnd, Present };
+    /// Recording thread: timestamps this point of the frame (cheap; nothing waits on it).
+    void MarkGpu(GpuMark mark);
+    /// GPU ms per frame since the last call, for frames that ran an upscaler: before it (from the
+    /// previous present), the upscaler itself, and after it up to the present. GPU wall time,
+    /// which is the GPU's work when the GPU is the bottleneck.
+    struct GpuSplit {
+        u64 frames{};
+        double pre_ms{};
+        double upscale_ms{};
+        double post_ms{};
+        double upscale_max_ms{};
+    };
+    [[nodiscard]] GpuSplit TakeGpuSplit();
+
+    /// Per-pass GPU timing (pass_timing): one frame every 2 s gets a timestamp where each render
+    /// pass, run of dispatches or upscale starts; a few presents later the "Nx2Pass GPU" line
+    /// names the 8 costliest targets and compute shaders of that frame.
+    /// PassDispatch: recording thread, a native dispatch of this compute shader.
+    void PassDispatch(u64 hash) {
+        if (pass_sampling) [[unlikely]] {
+            PassNoteDispatch(hash);
+        }
+    }
+    /// PassRescale: recording thread, a resolution-scale copy of an image starts (true) or ends.
+    void PassRescale(bool begin) {
+        if (pass_sampling) [[unlikely]] {
+            PassMark({.kind = begin ? PassKind::Rescale : PassKind::Other});
+            pass_framebuffer = nullptr;
+        }
+    }
     void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
     void TraceComputePipeline(u64 hash);
     /// Worker thread, inside a recorded command: timestamps one draw or dispatch of a sampled
@@ -222,7 +257,7 @@ public:
             FlushUploads();
         }
         ++record_serial;
-        if (Common::DkbFrameTrace::Enabled()) {
+        if (Common::DkbFrameTrace::GpuSitesEnabled()) {
             RecordSiteMarker(location);
         }
         if (chunk->Record(command)) {
@@ -232,7 +267,7 @@ public:
         (void)chunk->Record(command);
     }
 
-    /// Send work to a separate thread; `location` labels it in EDEN_DKB_FRAME_TRACE's gpu_site log.
+    /// Send work to a separate thread; `location` labels it in EDEN_DKB_GPU_SITES's gpu_site log.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
     void Record(T&& c, std::source_location location = std::source_location::current()) {
@@ -285,7 +320,10 @@ public:
     /// into the current chunk while that thread does (corrupt command buffers, crashes). They
     /// wait for the recording thread to submit the tick instead, and give up after 20 ms (it may
     /// be waiting for them).
-    void Wait(u64 tick, double target_fps = 0.0, bool may_flush = true) {
+    /// target_fps paces presents in game frames; game_frame_presents is how many presents show the
+    /// current one (see FramePacer).
+    void Wait(u64 tick, double target_fps = 0.0, bool may_flush = true,
+              u32 game_frame_presents = 1) {
         const bool trace = Common::DkbFrameTrace::Enabled() && target_fps > 0.0;
         const auto trace_start = trace ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
@@ -302,16 +340,8 @@ public:
         double trace_slept_ms{};
         if (Settings::values.use_speed_limit.GetValue() && target_fps > 0.0) {
             auto now = std::chrono::steady_clock::now();
-            if (last_target_fps != target_fps) {
-                frame_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(1.0 / target_fps));
-                max_frame_count = static_cast<int>(0.1 * target_fps);
-                last_target_fps = target_fps;
-                frame_counter = 0;
-                start_time = now;
-            }
-            frame_counter++;
-            auto target_time = start_time + frame_interval * frame_counter;
-            if (target_time >= now) {
+            if (const auto paced = frame_pacer.Next(now, target_fps, game_frame_presents)) {
+                const auto target_time = *paced;
                 constexpr auto spin_tail = std::chrono::milliseconds(1);
                 auto sleep_time = target_time - now;
                 if (trace) {
@@ -334,9 +364,6 @@ public:
                 while (std::chrono::steady_clock::now() < target_time) {
                     std::this_thread::yield();
                 }
-            } else if (frame_counter > max_frame_count) {
-                frame_counter = 0;
-                start_time = now;
             }
         }
         if (trace) {
@@ -485,7 +512,7 @@ private:
 
     void TraceGpuSubmission();
     void ReportWorkTimes();
-    /// EDEN_DKB_FRAME_TRACE: before each recorded command, a marker that timestamps it in
+    /// EDEN_DKB_GPU_SITES: before each recorded command, a marker that timestamps it in
     /// sampled submissions, so the frame's GPU time can be split by the code that recorded it.
     void RecordSiteMarker(std::source_location location);
     /// Worker thread, run by a marker: writes its timestamp while a sampled submission records.
@@ -495,6 +522,16 @@ private:
     void ReportSiteTimes(const std::vector<u64>& submission_begin,
                          const std::vector<u64>& submission_end);
     void TraceShader(u64 hash, u32 stage);
+    void TracePassShaders(u64 hash, u32 stage, u64 fragment_hash);
+    /// Worker thread, just before a render pass of a sampled submission ends: timestamps it and
+    /// keeps what was recorded since the previous pass ended.
+    void TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent);
+    /// Logs the sampled frame's GPU time by render pass (the 16 most expensive). Each pass is
+    /// timed from the end of the one before it, so compute and copies between them count with it.
+    /// MoltenVK samples timestamps only at Metal encoder boundaries, so this is the finest split
+    /// it gives.
+    void ReportPassTimes(const std::vector<u64>& submission_begin,
+                         const std::vector<u64>& submission_end);
 
     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
 
@@ -557,6 +594,29 @@ private:
     vk::QueryPool trace_site_pool;
     std::vector<SiteTrace> trace_site_items;
     u32 trace_site_count{};
+    /// A Metal counter sample buffer holds at most 4096 timestamps; MoltenVK emulates larger
+    /// pools with timestamps that do not measure the GPU.
+    static constexpr u32 TraceMaxPasses = 4096;
+    struct PassTrace {
+        struct Shaders {
+            u64 hash{};
+            u64 fragment_hash{};
+            u32 stage{};
+        };
+        u32 submission{};
+        u32 draws{};
+        u32 dispatches{};
+        VkExtent2D extent{};
+        u32 num_shaders{};
+        u32 untracked_uses{};
+        std::array<Shaders, 4> shaders{};
+    };
+    vk::QueryPool trace_pass_pool;
+    std::vector<PassTrace> trace_pass_items;
+    /// What each sampled submission recorded after its last render pass ended.
+    std::vector<PassTrace> trace_pass_tails;
+    PassTrace trace_pass;
+    u32 trace_pass_count{};
     Common::DkbFrameTrace::RateLimit trace_gpu_rate;
     u64 trace_gpu_tick{};
     u64 trace_frame_end{};
@@ -580,6 +640,56 @@ private:
     };
     mutable std::mutex gpu_busy_mutex;
     std::optional<GpuBusySample> gpu_busy;
+
+    // MarkGpu: 8 frames of 3 timestamps, read 4 presents later (worker thread only).
+    static constexpr u32 SplitFrames = 8;
+    vk::QueryPool split_query_pool;
+    u64 split_frame{};
+    std::array<u64, SplitFrames> split_slot_frame{};
+    std::array<u8, SplitFrames> split_slot_marks{};
+    void ReadGpuSplit(u64 frame);
+    std::mutex split_mutex;
+    GpuSplit split_totals;
+
+    // Per-pass timing (recording thread only; the query results are read there too).
+    /// Submit: from the end of one command buffer to the start of the next (the GPU idle, waiting
+    /// for work, plus the next submission's staging uploads).
+    enum class PassKind : u8 { Pass, Compute, Upscaler, Rescale, Submit, Other };
+    struct PassSegment {
+        PassLabel label{};
+        u64 shader{};
+        u32 work{}; ///< draws, or dispatches
+        PassKind kind{PassKind::Other};
+        /// Other: the call that asked for work outside a render pass (a copy, blit or clear).
+        const char* file{};
+        u32 line{};
+    };
+    static constexpr u32 PassMaxMarks = 4096;
+    vk::QueryPool pass_query_pool;
+    std::vector<PassSegment> pass_segments;
+    u32 pass_count{};
+    bool pass_sampling{};
+    bool pass_pending{};
+    u32 pass_wait_presents{};
+    u64 pass_samples{};
+    const Framebuffer* pass_framebuffer{};
+    std::chrono::steady_clock::time_point pass_last_sample{};
+    void PassMark(const PassSegment& segment);
+    void PassNoteDraw(const Framebuffer* framebuffer);
+    void PassNoteDispatch(u64 hash);
+    void PassPresent();
+    void ReadPassSample();
+
+    /// Under submit_mutex: how long a submission waited for it (Present holds it across
+    /// vkQueuePresentKHR, so a blocked present delays the next submission). Logged every 10 s.
+    void NoteSubmitLockWait(std::chrono::steady_clock::duration waited);
+    struct SubmitLockStats {
+        std::chrono::steady_clock::time_point window{};
+        u64 submits{};
+        u64 waited{};
+        double wait_ms{};
+        double max_ms{};
+    } submit_lock_stats;
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 
@@ -607,11 +717,7 @@ private:
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
     std::jthread worker_thread;
 
-    std::chrono::steady_clock::duration frame_interval{};
-    std::chrono::steady_clock::time_point start_time{};
-    double last_target_fps{};
-    u64 max_frame_count{};
-    u64 frame_counter{};
+    FramePacer frame_pacer;
 };
 
 } // namespace Vulkan

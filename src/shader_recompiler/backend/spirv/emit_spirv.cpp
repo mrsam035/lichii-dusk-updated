@@ -456,20 +456,27 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
 
 void SetupSignedNanCapabilities(const Profile& profile, const IR::Program& program,
                                 EmitContext& ctx, Id main_func) {
-    // The broken-driver workaround only drops the fp16 mode: without the fp32 one, NVIDIA folds
-    // clamps such as min(max(1/x, -FLT_MAX), FLT_MAX) away and 0 * (1/0) becomes NaN.
-    if (program.info.uses_fp16 && profile.support_fp16_signed_zero_nan_preserve &&
-        !profile.has_broken_fp16_float_controls) {
+    // Drivers with broken fp16 float controls (NVIDIA) get no mode in programs that use fp16
+    // (ff35ef8ec1, Fire Emblem: Three Houses). Native (Switch 2) programs still get the fp32 and
+    // fp64 ones there: without the fp32 mode the driver may fold clamps such as
+    // min(max(1/x, -FLT_MAX), FLT_MAX) away, so 0 * (1/0) gives NaN where the console gives 0
+    // (black and NaN-spread blocks in The Duskbloods).
+    const bool broken_fp16 = profile.has_broken_fp16_float_controls && program.info.uses_fp16;
+    if (broken_fp16 && !program.is_native) {
+        return;
+    }
+    const auto preserve = [&](u32 width) {
         ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 16U);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, width);
+    };
+    if (program.info.uses_fp16 && profile.support_fp16_signed_zero_nan_preserve && !broken_fp16) {
+        preserve(16U);
     }
     if (profile.support_fp32_signed_zero_nan_preserve) {
-        ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 32U);
+        preserve(32U);
     }
     if (program.info.uses_fp64 && profile.support_fp64_signed_zero_nan_preserve) {
-        ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 64U);
+        preserve(64U);
     }
 }
 
@@ -497,14 +504,18 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         }
         ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
     }
-    if (info.stores[IR::Attribute::ViewportIndex] && profile.support_multi_viewport) {
+    // A mesh program emulated as compute stores its Layer and ViewportIndex in its output buffer.
+    const bool stores_viewport_layer{!ctx.runtime_info.mesh_as_compute};
+    if (info.stores[IR::Attribute::ViewportIndex] && profile.support_multi_viewport &&
+        stores_viewport_layer) {
         ctx.AddCapability(spv::Capability::MultiViewport);
     }
     if (info.stores[IR::Attribute::ViewportMask] && profile.support_viewport_mask) {
         ctx.AddExtension("SPV_NV_viewport_array2");
         ctx.AddCapability(spv::Capability::ShaderViewportMaskNV);
     }
-    if (info.stores[IR::Attribute::Layer] || info.stores[IR::Attribute::ViewportIndex]) {
+    if ((info.stores[IR::Attribute::Layer] || info.stores[IR::Attribute::ViewportIndex]) &&
+        stores_viewport_layer) {
         if (profile.support_viewport_index_layer_non_geometry && ctx.stage != Stage::Geometry) {
             ctx.AddExtension("SPV_EXT_shader_viewport_index_layer");
             ctx.AddCapability(spv::Capability::ShaderViewportIndexLayerEXT);

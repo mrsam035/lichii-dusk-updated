@@ -29,7 +29,11 @@ K for DLAA, Quality and Balanced, M for Performance, and L for Ultra Performance
 L/M also work with the other quality modes, but cost more, particularly on RTX 20
 and 30 GPUs without native FP8 support. K is a useful alternative on those cards.
 J can reduce ghosting compared with K at the expense of more flicker. If Fire
-Emblem: Fortune's Weave shows horizontal lines with L/M at 2x, try K.
+Emblem: Fortune's Weave shows horizontal lines with L/M at 2x, try K. The
+Duskbloods shows the same lines with M at 2x (NVIDIA's own preset for Performance
+is M too), so above 1x it runs K in every mode whatever preset is selected; at 1x
+M runs as NVIDIA's preset for the mode. `EDEN_NX2_DUSK_DLSS_M=1` (live:
+`perf_flip dusk_dlss_m 1`) runs the selected preset as is.
 
 No NVIDIA DLL ships with Lichii. The Graphics download button obtains Streamline
 2.14.16 and DLSS 310.9.16 from NVIDIA after license acceptance. That runtime supports

@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #endif
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
+#include "video_core/renderer_vulkan/pass_label.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -74,6 +75,24 @@ struct ByteAddressedRange {
     return VkExtent2D{width / 2, height};
 }
 
+struct SamplerBinding {
+    struct Compatibility {
+        bool mag_linear : 1;
+        bool min_linear : 1;
+        bool mipmap_linear : 1;
+        bool anisotropy : 1;
+        bool compare : 1;
+        bool minmax : 1;
+        bool clamp_to_border : 1;
+        bool custom_border : 1;
+
+        bool operator==(const Compatibility&) const noexcept = default;
+    };
+
+    VkSampler handle{};
+    Compatibility compatibility{};
+};
+
 class TextureCacheRuntime {
 public:
     explicit TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -112,6 +131,10 @@ public:
     u64 GetDeviceMemorySlack() const;
 
     bool CanReportMemoryUsage() const;
+
+    /// The largest width and height a scaled image may take: the device's 2D image and
+    /// framebuffer limits (16384 on AMD).
+    u32 GetMaxScaledExtent() const noexcept;
 
     /// Images that did not fit the device memory budget so far (see MemoryAllocator).
     u32 MemoryPressureEvents() const noexcept {
@@ -243,6 +266,8 @@ public:
 
     void BarrierFeedbackLoop();
 
+    VkImageView ResolveColorFeedback(const ImageView& sampled, const ImageView& attachment);
+
     bool IsFormatDitherable(VideoCore::Surface::PixelFormat format);
     bool IsFormatScalable(VideoCore::Surface::PixelFormat format);
 
@@ -264,6 +289,9 @@ public:
                          std::array<f32, 2> motion_scale, std::array<u32, 2> max_render_size);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
+    /// The backend that last drew a DLSS replacement and why, so each change is logged once.
+    std::string_view last_upscale_backend;
+    std::string_view last_upscale_reason;
 
     /// The LOD bias Ocarina's FSR adds to mipmapped samplers this session (0 for other games or
     /// upscalers), resolved on first use.
@@ -271,22 +299,29 @@ public:
     std::optional<f32> ocarina_fsr_lod_bias;
     /// Set when the Ocarina upscaler fails during the session: samplers drop the bias again.
     bool ocarina_fsr_failed{};
+    SamplerBinding fallback_sampler{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
+    /// Smoothed time between upscales: a gap of 4 of these (at least 250 ms) resets the history.
+    f32 upscale_interval_ms = 1000.0f / 30.0f;
 
-    /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
+    /// Draws an upscaler's RGBA16F output (source_size of it) over the DLSS output and returns it
+    /// to GENERAL.
+    /// A smaller output (DLAA's render-sized one) is stretched.
     void DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
-                            VkSampler sampler);
+                            VkSampler sampler, VkExtent2D source_size);
 #ifdef EGLANTINE_STREAMLINE
     /// NVIDIA's DLSS (through NVIDIA Streamline) in place of the game's,
     /// before FSR 3.1, when the setting is on. Returns false to fall back to FSR 3.1.
     bool UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageView& input_color,
                          ImageView& motion_vectors, ImageView& depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool reset);
+                         std::array<f32, 2> motion_scale, bool reset,
+                         std::array<u32, 2> max_render_size);
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
     bool dlss_unsupported{};
+    bool temporal_dlss{}; ///< The last TemporalUpscale was meant for DLSS
 #endif
 
     /// TemporalUpscale's history: its previous result (images[current]) and the image the next
@@ -360,6 +395,17 @@ public:
         vk::Buffer bridge;
     };
     std::deque<PendingByteAddressedShadow> pending_byte_addressed_shadows;
+
+    struct ColorFeedbackSnapshot {
+        vk::Image image;
+        vk::ImageView view;
+        VideoCommon::Extent3D size;
+        VkComponentMapping swizzle;
+        u64 tick{};
+        u32 unused_frames{};
+        bool used_this_frame{};
+    };
+    std::vector<ColorFeedbackSnapshot> color_feedback_snapshots;
 };
 
 class Framebuffer {
@@ -442,6 +488,11 @@ public:
         return is_rescaled;
     }
 
+    /// Its targets, for the per-pass GPU timing.
+    [[nodiscard]] const PassLabel& Label() const noexcept {
+        return pass_label;
+    }
+
     [[nodiscard]] bool DiscardsMsaaColor() const noexcept {
         return discard_msaa_color;
     }
@@ -477,6 +528,7 @@ private:
     RenderPassCache* render_pass_cache{nullptr};
     bool discard_msaa_color{};
     bool discard_msaa_depth_stencil{};
+    PassLabel pass_label{};
     mutable std::array<u32, NUM_MEMOIZED_RENDER_PASS_VARIANTS> variant_keys{};
     mutable std::array<VkRenderPass, NUM_MEMOIZED_RENDER_PASS_VARIANTS> variant_render_passes{};
     mutable u32 num_memoized_variants{};
@@ -497,6 +549,11 @@ public:
     Image& operator=(Image&&) = default;
 
     u32 HostMipLevels() const noexcept;
+
+    /// The format a copy out of the host image yields: the guest format, or what a converted one
+    /// (ASTC re-compressed to BC1/BC3 or decoded to RGBA8, BCn decoded without host support) is
+    /// kept as.
+    [[nodiscard]] VideoCore::Surface::PixelFormat HostFormat() const;
 
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
@@ -832,6 +889,7 @@ public:
     CustomBorderColorBudget& operator=(CustomBorderColorBudget&& rhs) noexcept;
 
     bool TryAcquire(const Device& device, size_t count);
+    void Release(size_t count) noexcept;
 
 private:
     void Release() noexcept;
@@ -845,7 +903,7 @@ public:
     explicit Sampler(TextureCacheRuntime&, const Tegra::Texture::TSCEntry&);
 
     [[nodiscard]] VkSampler Handle() const noexcept {
-        return *variants.front().sampler;
+        return variants.front().binding.handle;
     }
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
@@ -880,13 +938,14 @@ private:
     struct Variant {
         VariantKey key;
         vk::Sampler sampler;
+        SamplerBinding binding;
     };
 
     static constexpr size_t MAX_VARIANTS = 32;
 
     [[nodiscard]] VariantKey MakeKey(const ImageView& image_view, bool is_depth) const noexcept;
     [[nodiscard]] VkSampler Find(const VariantKey& key) const noexcept;
-    VkSampler Emplace(VariantKey key);
+    VkSampler Emplace(VariantKey key, const SamplerBinding* fallback = nullptr);
 
     CustomBorderColorBudget custom_border_color_budget;
     std::vector<Variant> variants;

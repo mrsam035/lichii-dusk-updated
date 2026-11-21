@@ -7,6 +7,29 @@
 namespace Mode = VideoCommon::DlssMode;
 using Quality = Settings::NvidiaDlssQuality;
 
+TEST_CASE("The Duskbloods runs K above 1x and NVIDIA's preset for M at 1x", "[dlss_mode]") {
+    using Preset = Settings::NvidiaDlssPreset;
+    constexpr u64 dusk = 0x0400D1D02399A000ULL;
+    STATIC_REQUIRE(Mode::EffectivePreset(dusk, Preset::M, false, false) == Preset::NvidiaDefault);
+    STATIC_REQUIRE(Mode::EffectivePreset(dusk, Preset::L, false, false) == Preset::L);
+    STATIC_REQUIRE(Mode::EffectivePreset(dusk, Preset::M, false, true) == Preset::K);
+    STATIC_REQUIRE(Mode::EffectivePreset(dusk, Preset::NvidiaDefault, false, true) == Preset::K);
+    STATIC_REQUIRE(Mode::EffectivePreset(dusk, Preset::L, false, true) == Preset::K);
+    STATIC_REQUIRE(Mode::EffectivePreset(dusk, Preset::M, true, true) == Preset::M);
+    STATIC_REQUIRE(Mode::EffectivePreset(dusk, Preset::L, true, true) == Preset::L);
+    STATIC_REQUIRE(Mode::EffectivePreset(0x04007EF01F8AE000ULL, Preset::M, false, true) ==
+                   Preset::M);
+}
+
+TEST_CASE("The Duskbloods offers only the DLSS modes its render region fits", "[dlss_mode]") {
+    constexpr u64 dusk = Mode::DuskbloodsProgramId;
+    STATIC_REQUIRE(Mode::EffectiveQuality(dusk, Quality::Native) == Quality::Automatic);
+    STATIC_REQUIRE(Mode::EffectiveQuality(dusk, Quality::UltraPerformance) == Quality::Automatic);
+    STATIC_REQUIRE(Mode::EffectiveQuality(dusk, Quality::Quality) == Quality::Quality);
+    STATIC_REQUIRE(Mode::EffectiveQuality(0x04007EF01F8AE000ULL, Quality::Native) ==
+                   Quality::Native);
+}
+
 TEST_CASE("DLSS settings preserve old profiles and per-game overrides", "[dlss_mode]") {
     REQUIRE(Settings::values.nvidia_dlss_preset.GetDefault() == Settings::NvidiaDlssPreset::M);
     REQUIRE(Settings::values.nvidia_dlss_quality.GetDefault() == Quality::Automatic);
@@ -67,6 +90,8 @@ TEST_CASE("DLSS requested modes fall back to a validated automatic mode", "[dlss
     REQUIRE(fallback.mode == Quality::Performance);
     REQUIRE(fallback.fallback);
     REQUIRE(fallback.requested_range->min.width == 2400);
+    REQUIRE(fallback.range.max.width == 2000);
+    REQUIRE(valid.range.max.height == 1520);
     const auto unavailable = Mode::Select(Quality::Balanced, {1920, 1080}, {3840, 2160}, query);
     REQUIRE(unavailable.mode == Quality::Performance);
     REQUIRE(unavailable.fallback);

@@ -25,6 +25,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
@@ -3192,7 +3193,8 @@ public:
 
     /// Root tables: eight 256-byte tables written inline (method 0x504 selects a table, bits 0-2,
     /// and a byte offset, bits 8-15; each 0x508 writes the next word) that shaders read as constant
-    /// banks 24-31. NVN2 keeps push constants in bank 24, which the Ampere lowering reads as bank 17.
+    /// banks 24-31. NVN2 keeps push constants in bank 24. The Ampere lowering reads them all from
+    /// bank 17, table n at byte n * 256.
     struct RootTables {
         static constexpr u32 SelectMethod = 0x504 / 4;
         static constexpr u32 LoadMethod = 0x508 / 4;
@@ -3297,6 +3299,8 @@ public:
     static bool IsFastDrawVertexBuffer(u32 method);
     /// A vertex attribute format, when vertex input is dynamic state.
     static bool IsFastDrawVertexFormat(u32 method);
+    /// Counter resets and the render enable mode: query state every draw applies itself.
+    static bool IsFastDrawQueryMethod(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
     /// Writes constant buffer data at `offset` (`bytes` within the buffer) through the buffer
     /// CB_ADDRESS and CB_SIZE select, translated once per selection and memory map. False, having
@@ -3472,14 +3476,32 @@ private:
     // model). Read per engine, not at static initialization, which runs before the frontend
     // loads nx2_switches.txt.
     const bool trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
-    // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read per engine like the switch above. Every
+    // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY/_SLOW, read per engine like the switch above. Every
     // method checks them, so they are members rather than function statics (MSVC reads a
     // thread-local to check a static's initialization on every call).
     const bool skip_same_value_writes = [] {
         const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
         return value == nullptr || value[0] != '0';
     }();
-    const bool perf_verify = VideoCommon::Nx2Perf::Verify();
+    // Read live at each call (one relaxed atomic load; the debug server's perf_slow/perf_flip
+    // change them at frame ends): every choice is per method, both paths leave the same state.
+    static bool perf_slow_method() {
+        return VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodFast);
+    }
+    /// #1095's direct state register write in CallMethod. EDEN_NX2_DUSK_BACKX=off turns it off
+    /// for The Duskbloods: CallMethodFast, as before #1095.
+    static bool direct_state_write() {
+        return !VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::DirectStateWrite);
+    }
+    static bool perf_slow_cb_batch() {
+        return VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodCbBatch);
+    }
+    // The Duskbloods' pre-#1585 path too. Live for the back's WriteStateRegisters (blocks applied
+    // one write at a time); the front decides whether to send blocks when it starts (Front).
+    static bool perf_slow_state_blocks() {
+        return VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::StateBlocks) ||
+               VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::StateBlocks);
+    }
     const bool reg_block_verify = [] {
         const char* value = std::getenv("EDEN_NX2_REG_BLOCK_VERIFY");
         return value != nullptr && value[0] == '1';
@@ -3506,6 +3528,7 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    void FrontCaptureMmeWrite(const FrontState& state, u32 method, u32 value, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);

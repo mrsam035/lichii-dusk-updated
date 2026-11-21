@@ -49,6 +49,7 @@ enum class FrameGenState : u8 {
     UnsupportedSurface,
     MissingLosslessDll,
     NvidiaFrameGen,
+    MissingFlyHigh,
 };
 
 struct FrameGenStatus {
@@ -62,6 +63,8 @@ struct DlssStatus {
     Settings::NvidiaDlssQuality mode{};
     Settings::NvidiaDlssQuality requested{};
     Settings::NvidiaDlssPreset preset{};
+    bool streamline{};    ///< Streamline runs this session, so DLSS can be switched on live
+    std::string fallback; ///< Why DLSS gave way to FSR 3.1 this session, if it did
 };
 
 struct RendererSettings {

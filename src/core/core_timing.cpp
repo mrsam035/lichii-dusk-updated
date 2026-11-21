@@ -13,13 +13,16 @@
 #include <vector>
 #include "common/cpu_features.h"
 #include "common/cpu_features.h"
+#include "common/core_pinning.h"
 #include "common/logging.h"
+#include "common/thread.h"
 #include "common/thread_cpu_clock.h"
 
 #ifdef _WIN32
 #include "common/windows/timer_resolution.h"
 #endif
 
+#include "common/logging.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
@@ -43,6 +46,40 @@ constexpr u32 CpuClockTargetMhz(Settings::CpuClock clock) {
         return CPU_CLOCK_BASE_MHZ;
     }
 }
+
+#if defined(ARCHITECTURE_x86_64)
+constexpr u32 CntpctSyncSpeed = 1;
+static_assert(std::atomic<u32>::is_always_lock_free && sizeof(std::atomic<u32>) == sizeof(u32));
+static_assert(std::atomic<u64>::is_always_lock_free && sizeof(std::atomic<u64>) == sizeof(u64));
+static_assert(static_cast<u32>(Settings::CpuClock::Normal) == 0);
+
+static u32 ReadCntpctMode() {
+    return (static_cast<u32>(Settings::values.cpu_clock.GetValue()) << 1) |
+           (Settings::values.sync_core_speed.GetValue() ? CntpctSyncSpeed : 0);
+}
+
+void CoreTiming::ConfigureInlineCntpct(bool supported) {
+    const char* value = std::getenv("EDEN_NX2_JIT_INLINE_CNTPCT");
+    const bool enabled = value && value[0] == '1' && supported && is_multicore &&
+                         Common::g_wall_clock.IsNative();
+    inline_cntpct_mode.store(enabled ? ReadCntpctMode() : InlineCntpctDisabled,
+                             std::memory_order_relaxed);
+    if (enabled) {
+        LOG_INFO(Core_Timing, "Inline JIT guest counter enabled for Normal CPU clock without core speed sync");
+    }
+}
+
+void CoreTiming::RefreshInlineCntpct() {
+    if (InlineCntpctMode()) {
+        inline_cntpct_mode.store(ReadCntpctMode(), std::memory_order_relaxed);
+    }
+}
+
+const std::atomic<u32>* CoreTiming::InlineCntpctMode() const {
+    return inline_cntpct_mode.load(std::memory_order_relaxed) == InlineCntpctDisabled
+               ? nullptr : &inline_cntpct_mode;
+}
+#endif
 
 namespace {
 
@@ -136,6 +173,9 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
     if (const char* stats = std::getenv("EDEN_NX2_HOSTTIMING_STATS")) {
         host_wait_stats = std::strtol(stats, nullptr, 10) != 0;
     }
+    if (const char* spin = std::getenv("EDEN_NX2_HOSTTIMING_SPIN")) {
+        host_spin_env = std::strtol(spin, nullptr, 10) != 0 ? 1 : 0;
+    }
     if (is_multicore) {
         timer_thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("HostTiming");
@@ -171,8 +211,34 @@ void CoreTiming::WaitForEvent(s64 next_time, std::optional<s64> one_shot_time) {
     if (next_time <= start) {
         return;
     }
+    // Switch 2 titles: HostTiming joins the guest cores' and GPU threads' class (time critical),
+    // so it is not preempted by them and its timers (sysmix output) fire late. Once the program id
+    // is known (it is set after this thread starts). EDEN_NX2_HOSTTIMING_PRIO=0 keeps VeryHigh.
+    thread_local bool priority_checked = false;
+    if (!priority_checked) {
+        if (const u64 program_id = Settings::GetCurrentProgramID(); program_id != 0) {
+            priority_checked = true;
+            static const bool enabled = [] {
+                const char* value = std::getenv("EDEN_NX2_HOSTTIMING_PRIO");
+                return value == nullptr || std::strtol(value, nullptr, 10) != 0;
+            }();
+            if (enabled && (program_id >> 56) == 0x04) {
+                Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+                LOG_INFO(Core_Timing, "HostTiming priority: time critical (Switch 2 program {:016X})",
+                         program_id);
+            }
+        }
+    }
+    // The Duskbloods keeps the pre-#1016 hardware wait: an OS sleep at HostTiming priority woke
+    // 5+ ms late under its time-critical threads, which starved the sysmix output timer (a looping
+    // event, which the adaptive margin below does not spin for). Not where the fast processors are
+    // fewer than the busy threads: the spin takes one of them.
+    const bool spin = host_spin_env == 1 ||
+                      (host_spin_env == -1 &&
+                       Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL &&
+                       Common::FitsBusyThreads(Common::FastLogicalProcessors()));
     const s64 margin = t_host_wait_margin.Get(start);
-    const bool precise = one_shot_time && *one_shot_time - margin <= start;
+    const bool precise = spin || (one_shot_time && *one_shot_time - margin <= start);
     const s64 wake = one_shot_time ? (std::min)(next_time, *one_shot_time - margin) : next_time;
     const bool signalled = precise ? event.SpinFor(std::chrono::nanoseconds{next_time - start})
                                    : event.SleepFor(std::chrono::nanoseconds{wake - start});
@@ -206,12 +272,24 @@ void CoreTiming::ClearPendingEvents() {
     event.Set();
 }
 
+namespace {
+/// When the current pause began, for the long-pause log (0 while running).
+std::atomic<s64> g_pause_start_time{};
+} // Anonymous namespace
+
 void CoreTiming::Pause(bool is_paused) {
+    if (is_paused && !paused) {
+        g_pause_start_time = GetGlobalTimeNs().count();
+    }
     paused = is_paused;
     pause_event.Set();
 
     if (!is_paused) {
         pause_end_time = GetGlobalTimeNs().count();
+        const s64 start = g_pause_start_time.exchange(0);
+        if (start != 0 && pause_end_time - start >= 50'000'000) {
+            LOG_INFO(Core_Timing, "timing paused for {} ms", (pause_end_time - start) / 1'000'000);
+        }
     }
 }
 
@@ -322,11 +400,23 @@ void CoreTiming::ResetTicks() {
 
 u64 CoreTiming::GetClockTicks() const {
     u64 fres = is_multicore ? Common::g_wall_clock.GetCNTPCT() : Common::g_wall_clock.CPUTickToGuestCNTPCT(cpu_ticks);
-    if (const u32 target = CpuClockTargetMhz(Settings::values.cpu_clock.GetValue());
-        target != CPU_CLOCK_BASE_MHZ) {
+    Settings::CpuClock clock;
+    bool sync_core_speed;
+#if defined(ARCHITECTURE_x86_64)
+    const u32 mode = inline_cntpct_mode.load(std::memory_order_relaxed);
+    if (mode != InlineCntpctDisabled) {
+        clock = static_cast<Settings::CpuClock>(mode >> 1);
+        sync_core_speed = (mode & CntpctSyncSpeed) != 0;
+    } else
+#endif
+    {
+        clock = Settings::values.cpu_clock.GetValue();
+        sync_core_speed = Settings::values.sync_core_speed.GetValue();
+    }
+    if (const u32 target = CpuClockTargetMhz(clock); target != CPU_CLOCK_BASE_MHZ) {
         fres = fres * target / CPU_CLOCK_BASE_MHZ;
     }
-    if (::Settings::values.sync_core_speed.GetValue()) {
+    if (sync_core_speed) {
         auto const ticks = f64(fres);
         auto const speed_limit = f64(Settings::SpeedLimit()) * 0.01;
         return u64(ticks / speed_limit);
@@ -374,12 +464,14 @@ CoreTiming::NextEvents CoreTiming::AdvanceEvents() {
                 basic_lock.unlock();
 
                 // Time spent paused is not lateness: a callback that makes up for being late (the
-                // sysmix pump) would otherwise wait out the pause again after it.
-                const std::chrono::nanoseconds late_since_pause{
+                // sysmix pump) would otherwise wait out the pause again after it. Clamped, as
+                // SyncPause can move pause_end_time past now meanwhile.
+                const std::chrono::nanoseconds late_since_pause{(std::max)(
+                    s64{0},
                     evt_time < pause_end_time
                         ? (std::min)(late.count(),
                                      GetGlobalTimeNs().count() - static_cast<s64>(pause_end_time))
-                        : late.count()};
+                        : late.count())};
                 const auto new_schedule_time{event_type->callback(evt_time, late_since_pause)};
 
                 basic_lock.lock();
@@ -403,6 +495,8 @@ CoreTiming::NextEvents CoreTiming::AdvanceEvents() {
                 event_queue.update(evt.handle, Event{next_time, event_fifo_id++, evt.type,
                                                      next_schedule_time, evt.handle});
             }
+        } else {
+            event_queue.pop();
         }
 
         global_timer = GetGlobalTimeNs().count();

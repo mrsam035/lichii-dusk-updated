@@ -19,6 +19,7 @@
 #include "common/memory_detect.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/shutdown_progress.h"
@@ -51,6 +52,7 @@
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_system_control.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
@@ -58,8 +60,10 @@
 #include "core/hle/service/am/process_creation.h"
 #include "core/hle/service/apm/apm_controller.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/filesystem/fsp/fs_read_trace.h"
 #include "core/hle/service/glue/glue_manager.h"
 #include "core/hle/service/glue/time/static.h"
+#include "core/hle/service/glue/time/time_zone_binary.h"
 #include "core/hle/service/psc/time/static.h"
 #include "core/hle/service/psc/time/steady_clock.h"
 #include "core/hle/service/psc/time/system_clock.h"
@@ -70,6 +74,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/internal_network/local_redirect.h"
 #include "core/internal_network/network.h"
+#include "core/loader/deconstructed_rom_directory.h"
 #include "core/loader/loader.h"
 #include "core/loader/nx.h"
 #include "core/memory.h"
@@ -80,11 +85,17 @@
 #include "core/tools/renderdoc.h"
 #include "hid_core/hid_core.h"
 #include "network/network.h"
+#include "video_core/dlss_mode.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
+
+#ifndef _WIN32
+extern char** environ;
+#endif
 
 namespace Core {
 
@@ -134,7 +145,7 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
     }
 
     if (Common::FS::IsDir(path)) {
-        return vfs->OpenFile(path + "/main", FileSys::OpenMode::Read);
+        return Loader::ResolveLooseProgram(vfs->OpenDirectory(path, FileSys::OpenMode::Read));
     }
 
     return vfs->OpenFile(path, FileSys::OpenMode::Read);
@@ -152,6 +163,43 @@ std::optional<u64> Switch2ProgramId(FileSys::ProgramMetadata& metadata,
     return metadata.GetTitleID();
 }
 
+// One line with what decides a session's image and frame rate, so a report's log says it up front.
+void LogBootSummary(u64 program_id) {
+    const auto& v = Settings::values;
+    const auto preset = v.nvidia_dlss_preset.GetValue();
+    const auto effective = VideoCommon::DlssMode::EffectivePreset(program_id, preset);
+    std::string switches;
+#ifdef _WIN32
+    char** const environment = _environ;
+#else
+    char** const environment = environ;
+#endif
+    for (char** entry = environment; entry && *entry; ++entry) {
+        const std::string_view variable{*entry};
+        if (variable.starts_with("EDEN_NX2_") || variable.starts_with("EDEN_DKB_")) {
+            switches += switches.empty() ? "" : " ";
+            switches += variable;
+        }
+    }
+    const bool dusk_scaled = program_id == 0x0400D1D02399A000ULL &&
+                             v.resolution_info.up_scale > (1U << v.resolution_info.down_shift);
+    LOG_INFO(Core,
+             "Nx2Summary boot: program {:016X}, resolution {} ({:.2f}x), upscaler {}, DLSS mode {}, "
+             "preset {}{}, accuracy {}, vsync {}, window filter {}, fullscreen {}, memory layout {}, "
+             "pin GPU threads {}, switches [{}]{}",
+             program_id, v.resolution_setup.ToString(), v.resolution_info.up_factor,
+             v.nvidia_dlss.GetValue() ? "NVIDIA DLSS (FSR 3.1 if unavailable)" : "FSR 3.1",
+             v.nvidia_dlss_quality.ToString(), v.nvidia_dlss_preset.ToString(),
+             effective != preset ? fmt::format(" (runs {})", Settings::CanonicalizeEnum(effective))
+                                 : std::string{},
+             v.gpu_accuracy.ToString(), v.vsync_mode.ToString(), v.scaling_filter.ToString(),
+             v.fullscreen_mode.ToString(), v.memory_layout_mode.ToString(),
+             v.pin_gpu_threads.ToString(), switches,
+             dusk_scaled ? "; Duskbloods above 1x renders the scene and the upscale at 4x the "
+                           "pixels or more, tested at 1x"
+                         : "");
+}
+
 } // namespace
 
 // Detect the platform and program before initializing the kernel memory layout and guest clock.
@@ -160,20 +208,9 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
     FileSys::ProgramMetadata metadata;
     if (FileSys::NupContainer::IsNupFile(file)) {
         FileSys::NupContainer nup{file};
-        if (nup.GetStatus() != Loader::ResultStatus::Success) {
-            return std::nullopt;
-        }
-        const auto base = nup.FindBasePackage();
-        const auto update = nup.FindBestUpdatePackage();
-        std::optional<std::size_t> program;
-        if (update && nup.GetExeFSDir(*update) != nullptr) {
-            program = update;
-        } else if (base && nup.GetExeFSDir(*base) != nullptr) {
-            program = base;
-        }
-        const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return Switch2ProgramId(metadata, npdm);
+        const auto program = nup.SelectProgram();
+        return program ? Switch2ProgramId(metadata, program->exefs->GetFile("main.npdm"))
+                       : std::nullopt;
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
     if (type == Loader::FileType::NX) {
@@ -208,17 +245,33 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
         const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
         return Switch2ProgramId(metadata, npdm);
     }
+    if (type == Loader::FileType::NCA) {
+        const FileSys::NCA nca{file};
+        const auto exefs = nca.GetStatus() == Loader::ResultStatus::Success ? nca.GetExeFS() : nullptr;
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return Switch2ProgramId(metadata, npdm);
+    }
     const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
     const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
     return Switch2ProgramId(metadata, npdm);
 }
 
 struct System::Impl {
-    explicit Impl(System& system)
+    explicit Impl(System& system, Service::Account::ProfileStorage profile_storage)
         : kernel{system}, fs_controller{system}, hid_core{kernel}, cpu_manager{system},
-          reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {}
+          reporter{system, profile_storage == Service::Account::ProfileStorage::Scratch
+                               ? Reporter::FSAccessLogPolicy::Disabled
+                               : Reporter::FSAccessLogPolicy::Disk},
+          applet_manager{system}, frontend_applets{system},
+          profile_manager{std::make_shared<Service::Account::ProfileManager>(profile_storage)} {}
 
     u64 program_id;
+
+    void EnsureFilesystem() {
+        if (virtual_filesystem == nullptr) {
+            virtual_filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
+        }
+    }
 
     bool Initialize(System& system) {
         try {
@@ -236,10 +289,7 @@ struct System::Impl {
         core_timing.SetMulticore(is_multicore);
         core_timing.Initialize([&system]() { system.RegisterHostThread(); });
 
-        // Create a default fs if one doesn't already exist.
-        if (virtual_filesystem == nullptr) {
-            virtual_filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
-        }
+        EnsureFilesystem();
         if (content_provider == nullptr) {
             content_provider = std::make_unique<FileSys::ContentProviderUnion>();
         }
@@ -404,6 +454,12 @@ struct System::Impl {
             LOG_CRITICAL(Core, "Not enough host memory to start the guest kernel");
             return SystemResultStatus::ErrorMemoryAllocation;
         }
+        Kernel::Nx2ThreadStats::ReadSwitch();
+#if defined(ARCHITECTURE_x86_64)
+        core_timing.ConfigureInlineCntpct(!Kernel::Nx2ThreadStats::g_enabled &&
+                                         !system.DebuggerEnabled());
+#endif
+        Service::FileSystem::ReadTraceScope::ReadSwitch();
         kernel.Initialize();
         return SystemResultStatus::Success;
     }
@@ -416,6 +472,8 @@ struct System::Impl {
         host1x_core.emplace(system);
         VideoCore::CreateGPU(gpu_core, emu_window, system);
         if (!gpu_core) {
+            // As Load does: the kernel is up, and destroying it without its shutdown crashes.
+            ShutdownMainProcess();
             return SystemResultStatus::ErrorVideoCore;
         }
         is_powered_on = true;
@@ -423,7 +481,33 @@ struct System::Impl {
         return SystemResultStatus::Success;
     }
 
-    SystemResultStatus SetupForApplicationProcess(System& system, Frontend::EmuWindow& emu_window) {
+    SystemResultStatus SetupForApplicationProcess(
+        System& system, Frontend::EmuWindow& emu_window,
+        std::shared_ptr<const Service::SystemDataView> isolated_system_data = {}) {
+        if (profile_manager->IsScratch() != (isolated_system_data != nullptr)) {
+            LOG_ERROR(Core, "Isolated system data and a scratch profile must be selected together");
+            return SystemResultStatus::ErrorSystemFiles;
+        }
+
+        std::shared_ptr<Service::Glue::Time::TimeZoneBinary> isolated_time_zone;
+        u64 isolated_process_id{};
+        if (isolated_system_data) {
+            constexpr u64 NativeHomeProgramId = 0x0400000000001000;
+            const auto* process = kernel.ApplicationProcess();
+            if (!process || !process->IsSwitch2() || process->IsApplication() ||
+                process->GetProgramId() != NativeHomeProgramId || process->GetProcessId() == 0) {
+                LOG_ERROR(Core, "Isolated system data requires the native HOME process");
+                return SystemResultStatus::ErrorSystemFiles;
+            }
+            isolated_process_id = process->GetProcessId();
+            isolated_time_zone = std::make_shared<Service::Glue::Time::TimeZoneBinary>(system);
+            const auto result = isolated_time_zone->Mount(isolated_system_data);
+            if (result.IsFailure()) {
+                LOG_ERROR(Core, "Cannot mount isolated time-zone data: {:#x}", result.raw);
+                return SystemResultStatus::ErrorSystemFiles;
+            }
+        }
+
         host1x_core.emplace(system);
         VideoCore::CreateGPU(gpu_core, emu_window, system);
         if (!gpu_core)
@@ -432,7 +516,9 @@ struct System::Impl {
         audio_core.emplace(system);
 
         service_manager = std::make_shared<Service::SM::ServiceManager>(kernel);
-        services.emplace(service_manager, system, stop_event.get_token());
+        services.emplace(service_manager, system, stop_event.get_token(),
+                         std::move(isolated_system_data), std::move(isolated_time_zone),
+                         isolated_process_id);
 
         is_powered_on = true;
         exit_locked = false;
@@ -448,16 +534,19 @@ struct System::Impl {
     }
 
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
+        if (profile_manager->IsScratch()) {
+            return SystemResultStatus::ErrorSystemFiles;
+        }
+
         VideoCommon::StutterTrace::BootMarker("boot_start");
+        EnsureFilesystem();
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
         }
 
-        const std::optional<u64> switch2_program_id =
-            virtual_filesystem != nullptr
-                ? FindSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath),
-                                     params.program_id, params.program_index)
-                : std::nullopt;
+        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
+        const auto switch2_program_id =
+            FindSwitch2Program(file, params.program_id, params.program_index);
         const bool switch2_program = switch2_program_id.has_value();
         Kernel::KSystemControl::SetApplicationProgramId(switch2_program_id.value_or(0));
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
@@ -514,14 +603,15 @@ struct System::Impl {
             current_application_filepath = filepath;
         }
 
-        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
-
         // Create the application process
         Loader::ResultStatus load_result{};
         std::vector<u8> control;
         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
         if (load_result != Loader::ResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
+            // Its destructor finalizes the KProcess through the kernel: free it before the kernel
+            // shuts down, as a normal stop does.
+            process.reset();
             ShutdownMainProcess();
             return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
         }
@@ -530,9 +620,26 @@ struct System::Impl {
             LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
             // The kernel is already initialized. Left running, it is destroyed with the global
             // System after main() returns, when device memory is already gone, and exit crashes.
+            process.reset();
             ShutdownMainProcess();
             return SystemResultStatus::ErrorGetLoader;
         }
+
+        kernel.SetApplicationProcess(process->GetHandle());
+#ifdef HAS_HYPERVISOR
+        const bool has_hypervisor = static_cast<bool>(process->GetHandle()->GetMemory().GetHypervisor());
+        if (has_hypervisor && !cpu_manager.Initialize(process->GetHandle())) {
+            LOG_WARNING(Core, "Hypervisor vCPU setup failed; reloading the guest with Dynarmic");
+            process.reset();
+            ShutdownMainProcess();
+            SetShuttingDown(false);
+            allow_hypervisor_for_load = false;
+            SCOPE_EXIT {
+                allow_hypervisor_for_load = true;
+            };
+            return Load(system, emu_window, filepath, params);
+        }
+#endif
 
         if (app_loader->ReadProgramId(params.program_id) != Loader::ResultStatus::Success) {
             LOG_ERROR(Core, "Failed to find program id for ROM!");
@@ -547,22 +654,71 @@ struct System::Impl {
 
         // Expose program id to dump sites and other global readers.
         Settings::SetCurrentProgramID(params.program_id);
+        if (params.program_id == 0x0400D1D02399A000ULL) {
+            // One line naming the Duskbloods variants in effect (each switch is read where it acts;
+            // these are the same rules).
+            const auto env = [](const char* name) {
+                const char* value = std::getenv(name);
+                return std::string{value ? value : ""};
+            };
+            const auto flag = [&](const char* name, bool unset) {
+                const auto value = env(name);
+                return value.empty() ? unset : value[0] != '0';
+            };
+            const u32 back_off = VideoCommon::BackX::DuskOffMaskFromEnv(params.program_id);
+            LOG_INFO(Core,
+                     "Duskbloods variants: stack lowering {}, host-timing wait {}, upload stale {}, "
+                     "GPU-only regions {}, totals {} remote memory, AOFFI gather {}, "
+                     "host-timing priority {}, compute write mark {}, compute size word {}, ribbon {}, "
+                     "back cuts {} [{}], loaded-pointer loads {}, report reads wait {}, collector "
+                     "GPU waits {}, list-fed grid macros reverted (#1651)",
+                     env("EDEN_NX2_DUSK_STACK") == "upstream" ? "upstream (#1490)" : "v25 (fold)",
+                     flag("EDEN_NX2_HOSTTIMING_SPIN", true) ? "spin (v2.5)" : "OS sleep (#1016)",
+                     env("EDEN_NX2_UPLOAD_STALE").empty() || env("EDEN_NX2_UPLOAD_STALE")[0] == '1'
+                         ? "on (v2.5)"
+                         : "off (#818)",
+                     env("EDEN_NX2_GPU_MAP_FLAG_PROBE").empty() ||
+                             env("EDEN_NX2_GPU_MAP_FLAG_PROBE")[0] == '1'
+                         ? "client tile backing (v2.5)"
+                         : "server backed (#552)",
+                     env("EDEN_NX2_TOTAL_MINUS_REMOTE").starts_with('1') ? "minus (#552)"
+                                                                         : "include (v2.5)",
+                     env("EDEN_NX2_DUSK_GATHER") == "draw" ? "draw (#1363)" : "skip (v2.5)",
+                     flag("EDEN_NX2_HOSTTIMING_PRIO", true) ? "time critical" : "very high",
+                     env("EDEN_NX2_DUSK_SSBO_MARK") == "auto" ? "store extent (#816)"
+                                                              : "whole binding (v2.5)",
+                     env("EDEN_NX2_DUSK_SSBO_SIZE") == "v25" ? "8 MiB cap (v2.5)"
+                                                             : "read (#1231)",
+                     env("EDEN_NX2_DUSK_RIBBON") == "skip"   ? "skipped"
+                     : env("EDEN_NX2_DUSK_RIBBON") == "diag" ? "drawn, traced"
+                                                             : "drawn",
+                     back_off == 0 ? "upstream (#1586, #1585, #1095)"
+                                   : "old (pre-#1586, pre-#1585, pre-#1095) where =old",
+                     VideoCommon::BackX::DuskPiecesText(back_off),
+                     flag("EDEN_NX2_DUSK_LOADED_REBASE", true) ? "rebased" : "routed",
+                     env("EDEN_NX2_LEAN_REPORT_WAIT") == "verify"
+                         ? "for their reports, verified"
+                         : (flag("EDEN_NX2_LEAN_REPORT_WAIT", true) ? "for their reports (#559)"
+                                                                    : "for all GPU work"),
+                     flag("EDEN_NX2_TC_ONE_WAIT", true) ? "one a frame" : "unlimited");
+        }
 
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);
-
-        // Make the process created be the application
-        kernel.SetApplicationProcess(process->GetHandle());
 
         // Set up the rest of the system.
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
+            process.reset();
             ShutdownMainProcess();
             return init_result;
         }
         // Waiting for GPU before initializing CPU
-        cpu_manager.Initialize();
+#ifdef HAS_HYPERVISOR
+        if (!has_hypervisor)
+#endif
+            cpu_manager.Initialize();
 
         // Initialize cheat engine
         if (cheat_engine) {
@@ -575,7 +731,7 @@ struct System::Impl {
 
         if (Settings::values.gamecard_inserted) {
             if (Settings::values.gamecard_current_game) {
-                fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, filepath));
+                fs_controller.SetGameCard(file);
             } else if (!Settings::values.gamecard_path.GetValue().empty()) {
                 const auto& gamecard_path = Settings::values.gamecard_path.GetValue();
                 fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, gamecard_path));
@@ -596,6 +752,7 @@ struct System::Impl {
         }
 
         GameSettings::LoadOverrides(program_id, gpu_core->Renderer());
+        LogBootSummary(params.program_id);
         if (auto room_member = Network::GetRoomMember().lock()) {
             Network::GameInfo game_info;
             game_info.name = name;
@@ -617,6 +774,12 @@ struct System::Impl {
 
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
+
+        // The cheat VM runs on the timer thread, which keeps running through the teardown, and
+        // reads keys through the service manager and memory through the process. Freed below,
+        // they crashed it (a null ServiceManager at a stop, #1950). Its destructor waits for a
+        // run in progress.
+        cheat_engine.reset();
 
         // Once powered off, services stop writing replies, so a guest thread whose IPC call
         // completes would read its own request back and abort (2010-0212, a Userspace PANIC on
@@ -647,7 +810,6 @@ struct System::Impl {
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
-        cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
         Common::NoteShutdownProgress();
@@ -659,6 +821,14 @@ struct System::Impl {
         perf_stats.reset();
         cpu_manager.Shutdown();
         debugger.reset();
+        {
+            // The general channel's event is a kernel object made on first use. Left for ~Impl,
+            // it closed at exit() on a kernel already shut down (SIGSEGV in KAutoObject::Close).
+            // Its queued data stays for the next kernel, which remakes the event.
+            std::scoped_lock lk{general_channel_mutex};
+            general_channel_event.reset();
+            general_channel_context.reset();
+        }
         kernel.Shutdown();
         stop_event = {};
         Network::RestartSocketOperations();
@@ -716,11 +886,12 @@ struct System::Impl {
     Service::APM::Controller apm_controller{core_timing};
     /// Service State
     Service::Glue::ARPManager arp_manager;
-    Service::Account::ProfileManager profile_manager;
+    std::shared_ptr<Service::Account::ProfileManager> profile_manager;
     /// Network instance
     Network::NetworkInstance network_instance;
     Core::SpeedLimiter speed_limiter;
     ExecuteProgramCallback execute_program_callback;
+    LaunchInNewSessionCallback launch_in_new_session_callback;
     ExitCallback exit_callback;
     ApplicationChangedCallback application_changed_callback;
 
@@ -732,6 +903,9 @@ struct System::Impl {
     std::optional<Tegra::Host1x::Host1x> host1x_core;
     std::optional<Core::DeviceMemory> device_memory;
     bool guest_memory_released{};
+#ifdef HAS_HYPERVISOR
+    bool allow_hypervisor_for_load{true};
+#endif
     std::optional<AudioCore::AudioCore> audio_core;
     std::optional<Memory::CheatEngine> cheat_engine;
     std::optional<Tools::Freezer> memory_freezer;
@@ -749,8 +923,10 @@ struct System::Impl {
 
     /// Service manager
     std::shared_ptr<Service::SM::ServiceManager> service_manager;
-    /// ContentProviderUnion instance
-    std::unique_ptr<FileSys::ContentProviderUnion> content_provider;
+    /// ContentProviderUnion instance. Empty until a frontend sets its own, so a System nobody gave
+    /// a provider (tests, tools) still has one to look titles up in.
+    std::unique_ptr<FileSys::ContentProviderUnion> content_provider =
+        std::make_unique<FileSys::ContentProviderUnion>();
     /// AppLoader used to load the current executing application
     std::unique_ptr<Loader::AppLoader> app_loader;
     std::stop_source stop_event;
@@ -772,11 +948,17 @@ struct System::Impl {
         if (!general_channel_event) {
             general_channel_context.emplace(system, "GeneralChannel");
             general_channel_event.emplace(*general_channel_context);
+            if (!general_channel.empty()) {
+                general_channel_event->Signal(kernel);
+            }
         }
     }
 };
 
-System::System() : impl{std::make_unique<Impl>(*this)} {}
+System::System() : System{Service::Account::ProfileStorage::Shared} {}
+
+System::System(Service::Account::ProfileStorage profile_storage)
+    : impl{std::make_unique<Impl>(*this, profile_storage)} {}
 
 System::~System() = default;
 
@@ -855,6 +1037,12 @@ SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::stri
 bool System::IsPoweredOn() const {
     return impl->is_powered_on.load(std::memory_order::relaxed);
 }
+
+#ifdef HAS_HYPERVISOR
+bool System::IsHypervisorAllowedForLoad() const {
+    return impl->allow_hypervisor_for_load;
+}
+#endif
 
 void System::PrepareReschedule(const u32 core_index) {
     impl->kernel.PrepareReschedule(core_index);
@@ -1111,11 +1299,15 @@ const Service::APM::Controller& System::GetAPMController() const {
 }
 
 Service::Account::ProfileManager& System::GetProfileManager() {
-    return impl->profile_manager;
+    return *impl->profile_manager;
 }
 
 const Service::Account::ProfileManager& System::GetProfileManager() const {
-    return impl->profile_manager;
+    return *impl->profile_manager;
+}
+
+std::shared_ptr<Service::Account::ProfileManager> System::GetScratchProfileManager() const {
+    return impl->profile_manager->IsScratch() ? impl->profile_manager : nullptr;
 }
 
 void System::SetExitLocked(bool locked) {
@@ -1194,6 +1386,18 @@ void System::ExecuteProgram(std::size_t program_index) {
     }
 }
 
+void System::RegisterLaunchInNewSessionCallback(LaunchInNewSessionCallback&& callback) {
+    impl->launch_in_new_session_callback = std::move(callback);
+}
+
+bool System::LaunchInNewSession(u64 program_id) {
+    if (!impl->launch_in_new_session_callback) {
+        return false;
+    }
+    impl->launch_in_new_session_callback(program_id);
+    return true;
+}
+
 const std::string& System::GetCurrentApplicationFilePath() const {
     return impl->current_application_filepath;
 }
@@ -1220,9 +1424,10 @@ void System::PushGeneralChannelData(std::vector<u8>&& data) {
 
 bool System::TryPopGeneralChannel(std::vector<u8>& out_data) {
     std::scoped_lock lk{impl->general_channel_mutex};
-    if (!impl->general_channel_event || impl->general_channel.empty()) {
+    if (impl->general_channel.empty()) {
         return false;
     }
+    impl->EnsureGeneralChannelInitialized(*this);
     out_data = std::move(impl->general_channel.back());
     impl->general_channel.pop_back();
     if (impl->general_channel.empty()) {
@@ -1265,6 +1470,9 @@ void System::NotifyApplicationChanged(u64 program_id) {
 }
 
 void System::ApplySettings() {
+#if defined(ARCHITECTURE_x86_64)
+    impl->core_timing.RefreshInlineCntpct();
+#endif
     impl->RefreshTime(*this);
 
     if (IsPoweredOn()) {

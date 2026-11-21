@@ -451,6 +451,9 @@ void Fsr3Upscaler::CreateResources(VkExtent2D render_size, VkExtent2D upscale_si
 }
 
 void Fsr3Upscaler::Upscale(const Inputs& in) {
+    // Images at the largest render size, as the SDK's maxRenderSize (siko): a game with dynamic
+    // resolution (The Duskbloods) changes the render size every few frames, and recreating them
+    // each time reset the history and stalled.
     const VkExtent2D max_size{(std::max)(in.render_size.width, in.max_render_size.width),
                               (std::max)(in.render_size.height, in.max_render_size.height)};
     if (!output.image || max_size.width != render_extent.width ||

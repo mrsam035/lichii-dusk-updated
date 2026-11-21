@@ -31,6 +31,7 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #ifdef SHADER_SWEEP_V2
 #include "common/unique_function.h"
 #include "video_core/pipeline_cache_files.h"
@@ -873,12 +874,14 @@ std::vector<PipelineStage> CompileLegacyPipeline(std::span<OfflineEnvironment> e
     std::vector<PipelineStage> stages;
     if (envs.front().ShaderStage() == Stage::Compute) {
         OfflineEnvironment& env = envs.front();
+        u64 shader_hash;
+        std::memcpy(&shader_hash, key.data(), sizeof(shader_hash));
         diagnostic["phase"] = "translate";
         diagnostic["failed_slot"] = 0;
         Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{env.EntryPoint()}};
         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
         diagnostic["phase"] = "spirv";
-        stages.push_back({0, Stage::Compute, Shader::Backend::SPIRV::EmitSPIRV(profile, program)});
+        stages.push_back({0, Stage::Compute, Vulkan::EmitComputeShader(profile, program, shader_hash)});
         diagnostic.erase("failed_slot");
         return stages;
     }
@@ -928,7 +931,8 @@ std::vector<PipelineStage> CompileLegacyPipeline(std::span<OfflineEnvironment> e
         Shader::IR::Program& program = programs[stage.slot];
         auto runtime = PipelineRuntime(key, hashes, programs, program, previous);
         Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
-        stage.spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+        stage.spirv = Vulkan::EmitPipelineShader(profile, runtime, program, bindings,
+                                                 hashes[stage.slot]);
         previous = &program;
     }
     diagnostic.erase("failed_slot");
@@ -1346,7 +1350,8 @@ int main(int argc, char** argv) {
             if (arg == "--help") {
                 std::cout << "shader-sweep [INPUT] [--stage "
                              "vertex|tess-control|tess-eval|geometry|fragment|compute|task|mesh]\n"
-                             "  [--format instructions|native-header] [--environment FILE "
+                             "  [--format instructions|native-header] [--program-id HEX] "
+                             "[--environment FILE "
                              "--cache-version 46..54]\n"
                              "  [--guess-missing [--guess-cbuf0 HEX] [--guess-cbuf-other HEX]\n"
                              "   [--guess-texture-type N] [--guess-pixel-format N] "
@@ -1384,6 +1389,8 @@ int main(int argc, char** argv) {
                 format = value;
             else if (arg == "--environment")
                 environment = value;
+            else if (arg == "--program-id") // title gates, e.g. 0400D1D02399A000
+                Settings::SetCurrentProgramID(std::stoull(value, nullptr, 16));
             else if (arg == "--override-out")
                 override_out = value;
             else if (arg == "--pipeline-key")

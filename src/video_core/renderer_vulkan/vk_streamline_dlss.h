@@ -9,9 +9,11 @@
 #include <array>
 #include <atomic>
 #include <optional>
+#include <string_view>
 
 #include "common/common_types.h"
 #include "common/settings_enums.h"
+#include "video_core/dlss_mode.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -50,6 +52,10 @@ public:
         /// The depth image's size when it is larger than the render size (the scene lies in its
         /// top left corner); zero for the render size.
         VkExtent2D depth_size{};
+        /// The colour and motion images' sizes when the render size is only a region of them
+        /// (dynamic resolution); zero for the render size.
+        VkExtent2D color_size{};
+        VkExtent2D motion_size{};
         /// The scene camera, for DLSS Frame Generation. Row-major matrices that take a column
         /// vector, unjittered, with OpenGL clip depth (-1 to 1) and clip y up: the
         /// view-projection and the motion vectors' clip-to-previous-clip. Without it the frame
@@ -77,6 +83,9 @@ public:
     /// Evaluations that succeeded in this process, for the status bar.
     [[nodiscard]] static VideoCore::DlssStatus Status();
 
+    /// Writes the last "DLSS stats:" line, once, with why FSR 3.1 takes over for the session.
+    static void NoteFallback(std::string_view reason);
+
     [[nodiscard]] VkImage OutputImage() const noexcept {
         return *output_image;
     }
@@ -93,6 +102,15 @@ public:
 
 private:
     void CreateOutput(VkExtent2D upscale_size);
+    /// Render-sized copies of the inputs at 0,0 (dlss_tight), made when the size or a format
+    /// changes.
+    void CreateTightInputs(const Inputs& in);
+
+    struct TightImage {
+        vk::Image image;
+        vk::ImageView view;
+        VkFormat format{};
+    };
 
     const Device& device;
     Scheduler& scheduler;
@@ -100,11 +118,18 @@ private:
     void* set_options{}; ///< slDLSSSetOptions
     void* get_state{};   ///< slDLSSGetState
     void* get_optimal_settings{};
-    VkExtent2D render_extent{};
     VkExtent2D upscale_extent{};
+    /// Render sizes the selected mode accepts; only touched on the scheduler's worker. A dynamic
+    /// render size inside it keeps the mode and the history.
+    VideoCommon::DlssMode::Range mode_range{};
     bool hdr_input = true;
+    bool hdr_option{};
+    bool auto_exposure_option{};
+    bool tight_inputs{};
     Settings::NvidiaDlssQuality quality_mode{};
     Settings::NvidiaDlssPreset model_preset{};
+    std::array<TightImage, 3> tight{}; ///< colour, depth, motion
+    VkExtent2D tight_extent{};
     Settings::NvidiaDlssQuality evaluated_mode{}; ///< Recorded on the scheduler's worker
     u32 frame_index{};
     vk::Image output_image;

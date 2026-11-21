@@ -25,6 +25,7 @@
 #include "shader_recompiler/frontend/ir/breadth_first_search.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
+#include "shader_recompiler/ir_opt/dominance.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/shader_info.h"
 
@@ -120,6 +121,32 @@ u32 DynamicDescriptorCount(u32 base_offset, u32 size_shift, u32 max_descriptors)
         return 1;
     auto const available_count = 1U + (available - DESCRIPTOR_SIZE) / stride;
     return std::min(descriptor_limit, available_count);
+}
+
+// The elements a dynamic offset can select below the clamp to the last one: a bit index found by
+// FLO (FindUMsb, or 31 minus it for FLO.SH) takes one of 32. Its -1 for no bit set is past any
+// count, so it takes the last element as it does in a longer array.
+u32 DynamicDescriptorIndexLimit(const IR::U32& dynamic_offset, u32 size_shift) {
+    const IR::Inst* const offset = dynamic_offset.InstRecursive();
+    if (!offset || offset->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
+        !offset->Arg(1).IsImmediate() || offset->Arg(1).U32() != size_shift) {
+        return ~0U;
+    }
+    const auto is_bit_index = [](const IR::Value& value) {
+        const IR::Inst* inst = value.IsImmediate() ? nullptr : value.InstRecursive();
+        if (inst && inst->GetOpcode() == IR::Opcode::BitwiseXor32 && inst->Arg(1).IsImmediate() &&
+            inst->Arg(1).U32() == 31) {
+            inst = inst->Arg(0).IsImmediate() ? nullptr : inst->Arg(0).InstRecursive();
+        }
+        return inst && (inst->GetOpcode() == IR::Opcode::FindUMsb32 ||
+                        inst->GetOpcode() == IR::Opcode::FindSMsb32);
+    };
+    const IR::Value index = offset->Arg(0);
+    const IR::Inst* const select = index.IsImmediate() ? nullptr : index.InstRecursive();
+    if (select && select->GetOpcode() == IR::Opcode::SelectU32) {
+        return is_bit_index(select->Arg(1)) && is_bit_index(select->Arg(2)) ? 32U : ~0U;
+    }
+    return is_bit_index(index) ? 32U : ~0U;
 }
 
 u32 SaturatingSub(u32 lhs, u32 rhs) {
@@ -1062,84 +1089,6 @@ void TrimTrailingTees(std::vector<u32>& code) {
 // g_handle_index_allowed): the table entries a draw binds, larger indices taking the last one.
 constexpr u32 HANDLE_TABLE_SIZE = 64;
 
-// The block of each instruction and the immediate dominator of each block of the program the
-// pass on this thread runs on, built when a handle program first needs them (Cooper, Harvey and
-// Kennedy, over post order numbers).
-class Dominance {
-public:
-    explicit Dominance(const IR::Program& program) : order{program.post_order_blocks} {
-        for (size_t number = 0; number < order.size(); ++number) {
-            numbers.emplace(order[number], number);
-            for (const IR::Inst& inst : order[number]->Instructions()) {
-                blocks.emplace(&inst, order[number]);
-            }
-        }
-        idom.assign(order.size(), NONE);
-        if (order.empty()) {
-            return;
-        }
-        const size_t entry{order.size() - 1};
-        idom[entry] = entry;
-        const auto intersect = [this](size_t lhs, size_t rhs) {
-            while (lhs != rhs) {
-                while (lhs < rhs) lhs = idom[lhs];
-                while (rhs < lhs) rhs = idom[rhs];
-            }
-            return lhs;
-        };
-        for (bool changed = true; changed;) {
-            changed = false;
-            for (size_t number = entry; number-- > 0;) {
-                size_t dominator{NONE};
-                for (const IR::Block* const predecessor : order[number]->ImmPredecessors()) {
-                    const auto it{numbers.find(predecessor)};
-                    if (it == numbers.end() || idom[it->second] == NONE) {
-                        continue;
-                    }
-                    dominator = dominator == NONE ? it->second : intersect(it->second, dominator);
-                }
-                if (dominator != idom[number]) {
-                    idom[number] = dominator;
-                    changed = true;
-                }
-            }
-        }
-    }
-
-    /// Whether def runs before use on every path to use.
-    [[nodiscard]] bool Dominates(const IR::Inst* def, const IR::Inst* use) const {
-        const auto def_block{blocks.find(def)};
-        const auto use_block{blocks.find(use)};
-        if (def_block == blocks.end() || use_block == blocks.end()) {
-            return false;
-        }
-        if (def_block->second == use_block->second) {
-            for (const IR::Inst& inst : def_block->second->Instructions()) {
-                if (&inst == def) return true;
-                if (&inst == use) return false;
-            }
-            return false;
-        }
-        const size_t target{numbers.at(def_block->second)};
-        for (size_t number = numbers.at(use_block->second); idom[number] != NONE;) {
-            if (idom[number] == number) {
-                return false; // the entry
-            }
-            number = idom[number];
-            if (number == target) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-private:
-    static constexpr size_t NONE{~size_t{0}};
-    const IR::BlockList& order;
-    std::unordered_map<const IR::Block*, size_t> numbers;
-    std::unordered_map<const IR::Inst*, const IR::Block*> blocks;
-    std::vector<size_t> idom;
-};
 
 thread_local const IR::Program* g_program{};
 thread_local std::optional<Dominance> g_dominance;
@@ -1290,7 +1239,10 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         .secondary_offset = 0,
         .secondary_shift_left = 0,
         .dynamic_offset = dynamic_offset,
-        .count = DynamicDescriptorCount(base_offset, size_shift, (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit, resource_limit})),
+        .count = (std::min)(DynamicDescriptorCount(base_offset, size_shift,
+                                                   (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit,
+                                                               resource_limit})),
+                            DynamicDescriptorIndexLimit(dynamic_offset, size_shift)),
         .has_secondary = false,
     };
 }
