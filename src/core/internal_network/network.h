@@ -148,4 +148,7 @@ std::variant<std::vector<AddrInfo>, GetAddrInfoError> GetAddressInfo(
     const std::string& host, const std::optional<std::string>& service,
     Domain family = Domain::INET);
 
+/// True when EDEN_NX2_ONLINE_HOSTS redirects this name to the local stand-in servers.
+bool IsOnlineRedirectHost(const std::string& host);
+
 } // namespace Network

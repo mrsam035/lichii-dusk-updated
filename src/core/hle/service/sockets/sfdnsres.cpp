@@ -102,8 +102,8 @@ static const constexpr std::array blockedDomains = {
 };
 
 static bool IsBlockedHost(const std::string& host) {
-    if (Network::LocalRedirect::Matches(host)) {
-        return false; // Sent to the user's server (online_redirect_hosts).
+    if (Network::LocalRedirect::Matches(host) || Network::IsOnlineRedirectHost(host)) {
+        return false; // Resolved through either the upstream or Duskbloods local server redirect.
     }
     return std::any_of(
         blockedDomains.begin(), blockedDomains.end(),
