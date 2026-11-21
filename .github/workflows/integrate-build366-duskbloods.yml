@@ -256,6 +256,8 @@ jobs:
           git rm -f tools/merge-audit-trigger.txt 2>/dev/null || true
           rm -rf merge-conflicts merge-audit.txt
 
+          # Stage the hand-resolved conflict files before checking the index.
+          git add -A
           # There must be no unresolved merge stages or conflict markers in the candidate.
           if git ls-files -u | grep .; then
             echo "::error::unresolved merge stages remain"
