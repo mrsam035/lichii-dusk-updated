@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 concurrency:
   group: integrate-build366-duskbloods
@@ -38,6 +37,10 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add dusk https://github.com/Mr-Tb/lichii-dusk.git
           git fetch --no-tags dusk refs/heads/dusk-v4
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "Dusk v4 is already integrated into this branch; skipping."
+            exit 0
+          fi
           git merge --no-commit --no-ff FETCH_HEAD || true
 
           python3 - <<'PY'
@@ -248,53 +251,11 @@ jobs:
 
           PY
 
-          git rm -f .github/workflows/audit-dusk-v4-merge.yml 2>/dev/null || true
-          git rm -f .github/workflows/audit-user-branch-merge.yml 2>/dev/null || true
+          # Remove the temporary non-workflow audit trigger. Workflow files are updated later
+          # via the GitHub API because GITHUB_TOKEN cannot push edits to .github/workflows.
           git rm -f tools/merge-audit-trigger.txt 2>/dev/null || true
           rm -rf merge-conflicts merge-audit.txt
 
-          # Adapt upstream packaging to build only the requested standard Windows x64 and Linux
-          # x86_64 outputs. A push to this candidate branch must never publish an automatic Release.
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          path = Path(".github/workflows/release-binaries.yml")
-          text = path.read_text()
-          if "update/build366-duskbloods-final" not in text:
-              text = text.replace(
-                  "      - nx2-experimental\n",
-                  "      - nx2-experimental\n      - update/build366-duskbloods-final\n", 1
-              )
-          text = text.replace(
-              "if: github.event_name == 'push' || inputs.publish_release",
-              "if: (github.event_name == 'push' && github.ref_name == 'nx2-experimental') || inputs.publish_release"
-          )
-          text, count = re.subn(
-              r"      matrix:\n        include:\n.*?(?=\n\n    steps:)",
-              "      matrix:\n        include:\n"
-              "          - platform: linux-x86_64\n"
-              "            runner: ubuntu-24.04\n"
-              "          - platform: windows-x86_64\n"
-              "            runner: windows-2022",
-              text, count=1, flags=re.S
-          )
-          if count != 1:
-              raise RuntimeError("could not restrict release-binaries matrix to Linux and Windows standard")
-          path.write_text(text)
-
-          path = Path(".github/workflows/build-check.yml")
-          text = path.read_text()
-          text = text.replace(
-              "branches: [nx2, 'capy/nce-*']",
-              "branches: [nx2, dusk-v2, 'capy/nce-*']"
-          )
-          path.write_text(text)
-          PY
-
-          # Stage the manually resolved files first; Git otherwise still lists their old index
-          # stages as unmerged even though the working-tree content is resolved.
-          git add -A
           # There must be no unresolved merge stages or conflict markers in the candidate.
           if git ls-files -u | grep .; then
             echo "::error::unresolved merge stages remain"
