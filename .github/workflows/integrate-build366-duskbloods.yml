@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  workflows: write
 
 concurrency:
   group: integrate-build366-duskbloods
