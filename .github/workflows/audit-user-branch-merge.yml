@@ -1,0 +1,68 @@
+name: audit-user-branch-merge
+
+on:
+  push:
+    branches: [update/lichii-366-duskbloods]
+
+permissions:
+  contents: read
+
+jobs:
+  compare-merge-paths:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [dusk-v4, nx2]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Audit merge conflict set
+        shell: bash
+        run: |
+          set -u
+          if [ "${{ matrix.source }}" = "dusk-v4" ]; then
+            git remote add dusk https://github.com/Mr-Tb/lichii-dusk.git
+            git fetch --no-tags dusk refs/heads/dusk-v4
+          else
+            git remote add upstream https://github.com/zortos293/Lichii.git
+            git fetch --no-tags upstream refs/heads/nx2
+          fi
+          source_ref=FETCH_HEAD
+          common="$(git merge-base HEAD "$source_ref")"
+          {
+            echo "Our branch: $(git rev-parse HEAD)"
+            echo "Source ${{ matrix.source }}: $(git rev-parse "$source_ref")"
+            echo "Merge base: $common"
+            echo "Our-only commits: $(git rev-list --count "$common..HEAD")"
+            echo "Source-only commits: $(git rev-list --count "$common..$source_ref")"
+          } | tee audit.txt
+          git -c user.name=audit -c user.email=audit@example.invalid merge --no-commit --no-ff "$source_ref" >> audit.txt 2>&1 || true
+          conflicts="$(git diff --name-only --diff-filter=U || true)"
+          {
+            echo
+            echo "Conflict count: $(printf '%s\n' "$conflicts" | sed '/^$/d' | wc -l)"
+            printf '%s\n' "$conflicts"
+          } | tee -a audit.txt
+          mkdir -p conflicts
+          if [ -n "$conflicts" ]; then
+            while IFS= read -r file; do
+              [ -n "$file" ] || continue
+              mkdir -p "conflicts/$(dirname "$file")"
+              git show ":1:$file" > "conflicts/$file.base" 2>/dev/null || true
+              git show ":2:$file" > "conflicts/$file.ours" 2>/dev/null || true
+              git show ":3:$file" > "conflicts/$file.theirs" 2>/dev/null || true
+            done <<< "$conflicts"
+          fi
+      - name: Upload audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-audit-${{ matrix.source }}
+          path: |
+            audit.txt
+            conflicts/
+          if-no-files-found: warn
+          retention-days: 7
