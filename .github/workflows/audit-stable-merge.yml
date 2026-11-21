@@ -1,0 +1,60 @@
+name: audit-stable-merge
+
+on:
+  push:
+    branches: [audit/merge-stable-dusk-v2]
+
+permissions:
+  contents: read
+
+jobs:
+  merge-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Test merging our stable Duskbloods branch
+        shell: bash
+        run: |
+          set -u
+          git fetch --no-tags origin refs/heads/dusk-v2:refs/remotes/origin/dusk-v2
+          base="$(git merge-base HEAD origin/dusk-v2)"
+          stable="$(git rev-parse origin/dusk-v2)"
+          head="$(git rev-parse HEAD)"
+          {
+            echo "Candidate head: $head"
+            echo "Stable dusk-v2: $stable"
+            echo "Merge base: $base"
+            echo "Candidate-only commits: $(git rev-list --count "$base..HEAD")"
+            echo "Stable-only commits: $(git rev-list --count "$base..origin/dusk-v2")"
+            echo
+            echo "Attempting merge of stable branch into candidate; no commit will be made."
+          } | tee stable-merge-audit.txt
+          git -c user.name=audit -c user.email=audit@example.invalid merge --no-commit --no-ff origin/dusk-v2 >> stable-merge-audit.txt 2>&1 || true
+          conflicts="$(git diff --name-only --diff-filter=U || true)"
+          {
+            echo
+            echo "Conflict count: $(printf '%s\n' "$conflicts" | sed '/^$/d' | wc -l)"
+            if [ -n "$conflicts" ]; then printf '%s\n' "$conflicts"; else echo "(none)"; fi
+          } | tee -a stable-merge-audit.txt
+          mkdir -p stable-conflicts
+          if [ -n "$conflicts" ]; then
+            while IFS= read -r file; do
+              [ -n "$file" ] || continue
+              mkdir -p "stable-conflicts/$(dirname "$file")"
+              git show ":1:$file" > "stable-conflicts/$file.base" 2>/dev/null || true
+              git show ":2:$file" > "stable-conflicts/$file.candidate" 2>/dev/null || true
+              git show ":3:$file" > "stable-conflicts/$file.stable" 2>/dev/null || true
+            done <<< "$conflicts"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stable-dusk-v2-merge-audit
+          path: |
+            stable-merge-audit.txt
+            stable-conflicts/
+          if-no-files-found: warn
+          retention-days: 7
