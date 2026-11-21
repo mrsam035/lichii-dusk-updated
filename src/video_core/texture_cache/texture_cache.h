@@ -38,6 +38,7 @@
 #include "video_core/texture_cache/writeback_switches.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
 #include "video_core/texture_cache/conversion.h"
@@ -214,8 +215,31 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
     bool async_downloads = download_overlaps && AsyncOverlapDownloadsEnabled();
     KeepRanges keep;
     WritebackRanges::TickedRanges keep_ticks;
+    // Host commit, not the device, bounds the cache and at least 1 GiB of it is left: an image
+    // the GPU wrote that would be downloaded (a whole-GPU wait, ~23 ms a time in The Duskbloods at
+    // 2x) stays while it was used in the last MinEvictionAge frames, as with room: the game made
+    // it again at once, so deleting it freed nothing. Under 1 GiB of commit, or once an image could
+    // not be made, it goes as before. Checked here, before the pass counts the image, so kept
+    // images do not use up its iterations. EDEN_NX2_TC_KEEP_WRITTEN=0 turns this off.
+    static const bool keep_written_switch = [] {
+        const char* const value = std::getenv("EDEN_NX2_TC_KEEP_WRITTEN");
+        return !(value != nullptr && value[0] == '0');
+    }();
+    const bool keep_written =
+        keep_written_switch && !out_of_memory && commit_bound && host_commit_room >= 1_GiB;
+    // At most one download with a whole-GPU wait per frame (Fritchii EXP57): a pass that downloads
+    // image after image stalls the GPU thread for each. The rest wait for later frames, unless an
+    // image could not be made. On for The Duskbloods; EDEN_NX2_TC_ONE_WAIT=1/0 forces it.
+    static const bool one_wait_switch = [] {
+        const char* const value = std::getenv("EDEN_NX2_TC_ONE_WAIT");
+        if (value != nullptr && value[0] != '\0') {
+            return value[0] != '0';
+        }
+        return Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL;
+    }();
+    const bool one_wait = one_wait_switch && !out_of_memory;
     const auto CanEvict = [this, &high_priority_mode, &aggressive_mode, &evict_old_costly,
-                           &evict_bad_overlaps](ImageId image_id,
+                           &evict_bad_overlaps, keep_written, one_wait](ImageId image_id,
                                                 bool* out_must_download = nullptr) {
         const auto& image = slot_images[image_id];
         if (True(image.flags & ImageFlagBits::IsDecoding) ||
@@ -230,6 +254,15 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
         if ((!aggressive_mode && !evict_old_costly &&
              True(image.flags & ImageFlagBits::CostlyLoad)) ||
             (!high_priority_mode && must_download)) {
+            return false;
+        }
+        if (must_download && keep_written &&
+            frame_tick - lru_cache.Tick(image.lru_index) < MinEvictionAge) {
+            ++gc_kept_written;
+            return false;
+        }
+        if (must_download && one_wait && gc_waited_frame == frame_tick) {
+            ++gc_downloads_deferred;
             return false;
         }
         return true;
@@ -256,6 +289,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
         const bool covered =
             overlap_writeback && OverlapHasNewerData(image_id, image, keep, &keep_ticks);
         if (must_download) {
+            gc_waited_frame = frame_tick;
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
@@ -1521,6 +1555,8 @@ void TextureCache<P>::TickFrame() {
                         commit_room
                             ? HostCriticalMemory(runtime.GetDeviceMemoryUsage(), *commit_room)
                             : (std::numeric_limits<u64>::max)();
+                    commit_bound = host_critical < critical_memory;
+                    host_commit_room = commit_room ? *commit_room : 0;
                     critical_memory = (std::min)(critical_memory, host_critical);
                     retention_budget = RetentionBudget(retention_budget, budget);
                     const u64 room_margin =
@@ -1583,6 +1619,20 @@ void TextureCache<P>::TickFrame() {
                     const u64 change = critical_memory > logged_critical_memory
                                            ? critical_memory - logged_critical_memory
                                            : logged_critical_memory - critical_memory;
+                    if (commit_room) {
+                        Nx2Perf::g_commit_left_mib.store(*commit_room >> 20,
+                                                         std::memory_order_relaxed);
+                        // Little commit left: the cache shrinks and evicts all the time.
+                        static auto warned = std::chrono::steady_clock::time_point{};
+                        const auto now = std::chrono::steady_clock::now();
+                        if (*commit_room < 2_GiB && now - warned > std::chrono::minutes{1}) {
+                            warned = now;
+                            LOG_WARNING(HW_GPU,
+                                        "Setup warning: {} MiB of host commit left: close other "
+                                        "programs or raise the page file size",
+                                        *commit_room >> 20);
+                        }
+                    }
                     const bool log = budget_check_frames == 1 || change >= 256_MiB;
                     if (log) {
                         logged_critical_memory = critical_memory;
@@ -1693,9 +1743,9 @@ void TextureCache<P>::TickFrame() {
         if constexpr (requires { runtime.LogMemoryStatistics(); }) {
             runtime.LogMemoryStatistics();
         }
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha",
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded, {} written kept, {} downloads deferred), {} async decodes, ASTC {} opaque / {} alpha",
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
-                 gc_download_deletes,
+                 gc_download_deletes, gc_kept_written, gc_downloads_deferred,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
@@ -1720,7 +1770,8 @@ void TextureCache<P>::TickFrame() {
         created_shapes.clear();
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
         debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
-        gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+        gc_deletes = gc_costly_deletes = gc_download_deletes = gc_kept_written =
+            gc_downloads_deferred = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
     // An image that could not be made at all: the driver is out of memory whatever the counts
@@ -1862,8 +1913,13 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
                         continue;
                     }
                     auto& image = slot_images[image_view.image_id];
-                    has_blacklisted |= ScaleDown(image);
+                    const bool scaled_down =
+                        ScaleDown(image, Nx2Perf::RescaleReason::Storage);
+                    has_blacklisted |= scaled_down;
                     image.scale_rating = 0;
+                    if (scaled_down) {
+                        MaybePin(image);
+                    }
                 }
             }
         }
@@ -2168,10 +2224,32 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
 template <class P>
 bool TextureCache<P>::RescaleRenderTargets() {
     auto& flags = maxwell3d->dirty.flags;
+    if (const bool pin = Nx2Perf::LiveOr(Nx2Perf::g_rescale_pin,
+                                         Settings::GetCurrentProgramID() ==
+                                             DlssMode::DuskbloodsProgramId),
+        main = Nx2Perf::LiveOr(Nx2Perf::g_pin_main, true),
+        strict = Nx2Perf::LiveOr(Nx2Perf::g_pin_strict, true);
+        pin != pin_active || main != pin_main || strict != pin_strict) {
+        pin_active = pin;
+        pin_main = main;
+        pin_strict = strict;
+        ++pin_generation;
+        pinned_shapes.clear();
+        Nx2Perf::g_rescale_pins_total.store(0, std::memory_order_relaxed);
+    }
     u32 scale_rating = 0;
     bool rescaled = false;
     std::array<ImageId, NUM_RT> tmp_color_images{};
     ImageId tmp_depth_image{};
+    // The Duskbloods: a colour-only clear leaves a scaled depth target out of the vote. It clears
+    // 96x56 tile targets (too small to scale) with its main depth still bound, which took that
+    // depth to 1x and back every frame: two full-size depth copies, and a 2x depth rebuilt from
+    // 1x. Only a scaled depth is left out, so the framebuffer never exceeds an attachment.
+    const bool colour_only_clear =
+        clearing_render_targets && !maxwell3d->regs.clear_surface.Z &&
+        !maxwell3d->regs.clear_surface.S &&
+        Settings::GetCurrentProgramID() == DlssMode::DuskbloodsProgramId;
+    bool depth_left_out = false;
     do {
         flags[Dirty::RenderTargets] = false;
 
@@ -2190,7 +2268,7 @@ bool TextureCache<P>::RescaleRenderTargets() {
                 const auto image_id = view.image_id;
                 id_save = image_id;
                 auto& image = slot_images[image_id];
-                can_rescale &= ImageCanRescale(image);
+                can_rescale &= ImageCanRescale(image) && !Pinned(image);
                 any_rescaled |= True(image.flags & ImageFlagBits::Rescaled) ||
                                 GetFormatType(image.info.format) != SurfaceType::ColorTexture;
                 scale_rating = std::max<u32>(scale_rating, image.scale_tick <= frame_tick
@@ -2213,14 +2291,42 @@ bool TextureCache<P>::RescaleRenderTargets() {
             flags[Dirty::ZetaBuffer] = false;
             BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer());
         }
-        check_rescale(render_targets.depth_buffer_id, tmp_depth_image);
+        const ImageViewId depth_view = render_targets.depth_buffer_id;
+        depth_left_out = colour_only_clear && depth_view != NULL_IMAGE_VIEW_ID &&
+                         depth_view != ImageViewId{} &&
+                         True(slot_images[slot_image_views[depth_view].image_id].flags &
+                              ImageFlagBits::Rescaled);
+        if (depth_left_out) {
+            tmp_depth_image = CORRUPT_ID;
+        } else {
+            check_rescale(depth_view, tmp_depth_image);
+        }
+        if (pin_active && pin_main) {
+            // pin_main: a pass drawing a main frame image and a pinned one releases the pinned
+            // ones, so a pin never drags the main frame to 1x.
+            std::array<ImageId, NUM_RT + 1> ids{};
+            std::ranges::copy(tmp_color_images, ids.begin());
+            ids.back() = tmp_depth_image;
+            if (ReleaseNearMain(ids)) {
+                can_rescale = true;
+                for (const ImageId id : ids) {
+                    if (id != CORRUPT_ID) {
+                        Image& image = slot_images[id];
+                        can_rescale &= ImageCanRescale(image) && !Pinned(image);
+                    }
+                }
+            }
+            if (!can_rescale) {
+                can_rescale = RaiseMainPartners(ids);
+            }
+        }
 
         if (can_rescale) {
             rescaled = any_rescaled || scale_rating >= 2;
             const auto scale_up = [this](ImageId image_id) {
                 if (image_id != CORRUPT_ID) {
                     Image& image = slot_images[image_id];
-                    ScaleUp(image);
+                    ScaleUp(image, Nx2Perf::RescaleReason::Target);
                 }
             };
             if (rescaled) {
@@ -2235,7 +2341,9 @@ bool TextureCache<P>::RescaleRenderTargets() {
             const auto scale_down = [this](ImageId image_id) {
                 if (image_id != CORRUPT_ID) {
                     Image& image = slot_images[image_id];
-                    ScaleDown(image);
+                    if (ScaleDown(image, Nx2Perf::RescaleReason::TargetPartner)) {
+                        MaybePin(image);
+                    }
                 }
             };
             for (size_t index = 0; index < NUM_RT; ++index) {
@@ -2245,6 +2353,10 @@ bool TextureCache<P>::RescaleRenderTargets() {
             scale_rating = 1;
         }
     } while (has_deleted_images);
+    if (depth_left_out) {
+        // The next draw looks the targets up again and scales its depth as usual.
+        flags[Dirty::RenderTargets] = true;
+    }
     const auto set_rating = [this, scale_rating](ImageId image_id) {
         if (image_id != CORRUPT_ID) {
             Image& image = slot_images[image_id];
@@ -2886,8 +2998,25 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
 
     const bool is_resolve = src_image.info.num_samples != 1 && dst_image.info.num_samples == 1;
     if (is_src_rescaled != is_dst_rescaled) {
+        if (static u32 logged{}; (Pinned(src_image) || Pinned(dst_image)) && logged < 16) {
+            ++logged;
+            LOG_INFO(HW_GPU,
+                     "Blit leaves pinned image at 1x: src {:#x} {}x{} fmt {} scaled={} -> dst "
+                     "{:#x} {}x{} fmt {} scaled={}",
+                     src_image.gpu_addr, src_image.info.size.width, src_image.info.size.height,
+                     src_image.info.format, is_src_rescaled, dst_image.gpu_addr,
+                     dst_image.info.size.width, dst_image.info.size.height,
+                     dst_image.info.format, is_dst_rescaled);
+        }
+        // pin_blit: a pinned destination stays at 1x (the blit reads the scaled source at its own
+        // size); only a main frame destination releases the pins, so its source can follow it.
+        // The Duskbloods' history fill (scaled upscaler output into the RGBA16F history the next
+        // frame's imageStore writes at 1x) raised the history every frame and lowered it again.
+        if (!Nx2Perf::LiveOr(Nx2Perf::g_pin_blit, true) || IsMain(dst_image)) {
+            ReleaseNearMain(std::array{src_id, dst_id});
+        }
         if (ImageCanRescale(src_image)) {
-            ScaleUp(src_image);
+            ScaleUp(src_image, Nx2Perf::RescaleReason::Blit);
             is_src_rescaled = True(src_image.flags & ImageFlagBits::Rescaled);
             if (is_resolve) {
                 dst_image.info.rescaleable = true;
@@ -2898,14 +3027,14 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
             }
         }
         if (ImageCanRescale(dst_image)) {
-            ScaleUp(dst_image);
+            ScaleUp(dst_image, Nx2Perf::RescaleReason::Blit);
             is_dst_rescaled = True(dst_image.flags & ImageFlagBits::Rescaled);
         }
     }
     if (is_resolve && (is_src_rescaled != is_dst_rescaled)) {
         // A resolve requires both images to be the same dimensions. Resize down if needed.
-        ScaleDown(src_image);
-        ScaleDown(dst_image);
+        ScaleDown(src_image, Nx2Perf::RescaleReason::Blit);
+        ScaleDown(dst_image, Nx2Perf::RescaleReason::Blit);
         is_src_rescaled = True(src_image.flags & ImageFlagBits::Rescaled);
         is_dst_rescaled = True(dst_image.flags & ImageFlagBits::Rescaled);
     }
@@ -3023,7 +3152,8 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
                                       const Tegra::Texture::TICEntry* depth,
                                       std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
                                       bool use_history,
-                                      std::optional<std::array<u32, 2>> render_region) {
+                                      std::optional<std::array<u32, 2>> render_region,
+                                      const std::pair<ImageInfo, GPUVAddr>* depth_target) {
     if constexpr (FRAMEBUFFER_BLITS) {
         return false;
     } else {
@@ -3051,9 +3181,13 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
             FindOrInsertImage(motion_info, motion_surface.Address(), RelaxedOptions{});
         // The depth only feeds NVIDIA DLSS and FSR 3.1 (looked up only when they can run); without
         // it the stand-in runs.
+        // A depth target (The Duskbloods, tracked from its draws) instead of a texture.
         ImageId depth_id{};
-        if (use_history && depth && motion_id && runtime.WantsTemporalUpscaleDepth()) {
-            depth_id = FindOrInsertImage(ImageInfo(*depth), depth->Address(), RelaxedOptions{});
+        const GPUVAddr depth_address =
+            depth_target ? depth_target->second : depth ? depth->Address() : GPUVAddr{};
+        if (use_history && depth_address && motion_id && runtime.WantsTemporalUpscaleDepth()) {
+            depth_id = FindOrInsertImage(depth_target ? depth_target->first : ImageInfo(*depth),
+                                         depth_address, RelaxedOptions{});
             if (!depth_id) {
                 return false;
             }
@@ -3068,36 +3202,105 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         PrepareImage(dst_id, true, false);
         if (depth_id) {
             PrepareImage(depth_id, false, false);
-            if (slot_images[depth_id].info.num_samples != 1 ||
-                !VideoCommon::DlssContract::IsUpscalerDepthFormat(slot_images[depth_id].info.format)) {
-                return false;
+            // A tracked Duskbloods depth target can also use the formats measured in v31.
+    const PixelFormat depth_format = slot_images[depth_id].info.format;
+    const bool depth_format_ok =
+        VideoCommon::DlssContract::IsUpscalerDepthFormat(depth_format) ||
+        (depth_target && (depth_format == PixelFormat::D24_UNORM_S8_UINT ||
+                          depth_format == PixelFormat::X8_D24_UNORM ||
+                          depth_format == PixelFormat::D32_FLOAT_S8_UINT));
+    if (slot_images[depth_id].info.num_samples != 1 || !depth_format_ok) {                return false;
             }
+        }
+        if (static bool logged{}; depth_target && !std::exchange(logged, true)) {
+            const auto describe = [&](ImageId id) {
+                const auto& info = slot_images[id].info;
+                return fmt::format("{}x{} format {}", info.size.width, info.size.height,
+                                   static_cast<u32>(info.format));
+            };
+            LOG_INFO(HW_GPU, "Duskbloods upscale images: color {}, motion {}, depth {}, output {}",
+                     describe(result->src_id), describe(motion_id),
+                     depth_id ? describe(depth_id) : std::string{"none"},
+                     describe(result->dst_id));
         }
         for (const ImageId id : {src_id, motion_id, dst_id}) {
             if (slot_images[id].info.num_samples != 1) {
                 return false;
             }
         }
+        if (depth_target && pin_main) {
+            // pin_main: the upscaler's images are the main frame.
+            for (const ImageId id : {src_id, motion_id, dst_id, depth_id}) {
+                if (id) {
+                    ReleasePin(slot_images[id]);
+                    slot_images[id].main_tick = frame_tick + 1;
+                }
+            }
+            last_upscale_tick = frame_tick;
+        }
         // With resolution scaling, bring the images that can follow to the same scale, as BlitImage
         // does; the stand-in reads each image at its own size, so any left behind still work.
         const auto rescaled = [&](ImageId id) {
             return True(slot_images[id].flags & ImageFlagBits::Rescaled);
         };
+        // Before the upscaler raises it: a colour drawn at 1x and raised here is 1x content.
+        const bool src_drawn_scaled = rescaled(src_id);
         if (rescaled(src_id) || rescaled(motion_id) || rescaled(dst_id) ||
             (depth_id && rescaled(depth_id))) {
             for (const ImageId id : {src_id, motion_id, dst_id, depth_id}) {
-                if (id && !rescaled(id) && ImageCanRescale(slot_images[id])) {
-                    ScaleUp(slot_images[id]);
+                if (id && !rescaled(id) && ImageCanRescale(slot_images[id]) &&
+                    !Pinned(slot_images[id])) {
+                    ScaleUp(slot_images[id], Nx2Perf::RescaleReason::Upscaler);
+                }
+            }
+        }
+        // What the upscaler is handed (Nx2Perf::PushUpscale): each input's image, and how many
+        // upscales ago it was last written.
+        const auto note_input = [&](std::size_t slot, ImageId id) {
+            if (!id) {
+                return Nx2Perf::UpscaleInput{};
+            }
+            const Image& image = slot_images[id];
+            UpscaleSeen& seen = upscale_seen[slot];
+            seen.age = seen.id == id && seen.modification_tick == image.modification_tick
+                           ? seen.age + 1
+                           : 0;
+            seen.id = id;
+            seen.modification_tick = image.modification_tick;
+            return Nx2Perf::UpscaleInput{image.gpu_addr, image.info.size.width,
+                                         image.info.size.height, rescaled(id), seen.age};
+        };
+        {
+            const Extent3D color_size = slot_images[src_id].info.size;
+            const std::array<u32, 2> region =
+                render_region.value_or(std::array{color_size.width, color_size.height});
+            Nx2Perf::PushUpscale({
+                .frame = frame_tick,
+                .color = note_input(0, src_id),
+                .depth = note_input(1, depth_id),
+                .motion = note_input(2, motion_id),
+                .region_width = region[0],
+                .region_height = region[1],
+                .jitter = jitter,
+                .motion_scale = motion_scale,
+                .reset = !use_history,
+            });
+            if (depth_target) {
+                Nx2Perf::g_upscales_tried.fetch_add(1, std::memory_order_relaxed);
+                if (src_drawn_scaled && rescaled(src_id)) {
+                    Nx2Perf::g_upscales_2x.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
         // FSR 3.1 reads colour, motion and depth texel for texel: all at the colour's scale.
         if (depth_id && (rescaled(depth_id) != rescaled(src_id) ||
                          rescaled(motion_id) != rescaled(src_id))) {
+            Nx2Perf::SetUpscaleOutcome(Nx2Perf::UpscaleOutcome::ScaleMismatch);
             return false;
         }
         const Extent3D src_size = slot_images[src_id].info.size;
         if (src_size.width != src.width || src_size.height != src.height) {
+            Nx2Perf::SetUpscaleOutcome(Nx2Perf::UpscaleOutcome::SizeMismatch);
             return false;
         }
         // The game may render only part of its colour target.
@@ -3126,27 +3329,33 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         const auto motion_view = view(motion_id, motion_surface, motion_info.format);
         const auto dst_view = view(dst_id, dst, result->dst_format);
         if (!src_view || !motion_view || !dst_view) {
+            Nx2Perf::SetUpscaleOutcome(Nx2Perf::UpscaleOutcome::NoView);
             return false;
         }
         ImageViewId depth_view{};
         if (depth_id) {
-            if (const std::optional base = slot_images[depth_id].TryFindBase(depth->Address())) {
+            if (const std::optional base = slot_images[depth_id].TryFindBase(depth_address)) {
                 const SubresourceRange range{.base = *base, .extent = {1, 1}};
                 depth_view = FindOrEmplaceImageView(
                     depth_id, ImageViewInfo(ImageViewType::e2D, slot_images[depth_id].info.format,
                                             range));
             }
             if (!depth_view) {
+                Nx2Perf::SetUpscaleOutcome(Nx2Perf::UpscaleOutcome::NoView);
                 return false;
             }
         }
         // After the views: creating them may reallocate the framebuffer slots.
         Framebuffer* const dst_framebuffer = &slot_framebuffers[dst_view->first];
-        return runtime.TemporalUpscale(
+        const bool upscaled = runtime.TemporalUpscale(
             dst_framebuffer, slot_image_views[dst_view->second], slot_image_views[src_view->second],
             slot_image_views[motion_view->second],
             depth_view ? &slot_image_views[depth_view] : nullptr, render_size, jitter,
             motion_scale, use_history);
+        if (!upscaled) {
+            Nx2Perf::SetUpscaleOutcome(Nx2Perf::UpscaleOutcome::Declined);
+        }
+        return upscaled;
     }
 }
 
@@ -3555,7 +3764,17 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
 
     // Made where a dropped GPU-written image left stale bytes (MarkStale): nothing to upload.
     // Pages the buffer cache wrote on the GPU may hold data written back since: upload those.
-    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && image.dirty_layers.empty() &&
+    // EDEN_NX2_UPLOAD_STALE (from open PR #1501): unset = upload anyway for The Duskbloods (as
+    // dusk-v2.5, before #818: the skip left leftover host memory in its new targets), 1 = upload
+    // for every title, 0 = skip (#818).
+    static const int upload_stale_env = [] {
+        const char* value = std::getenv("EDEN_NX2_UPLOAD_STALE");
+        return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
+    }();
+    const bool upload_stale =
+        upload_stale_env == -1 ? Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL
+                               : upload_stale_env == 1;
+    if (!upload_stale && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && image.dirty_layers.empty() &&
         False(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
                              ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked)) &&
         stale_pages.IsAll(image.cpu_addr, image.guest_size_bytes)) {
@@ -4176,7 +4395,14 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
 
 template <class P>
 bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
-    if (!image.info.rescaleable) {
+    // pin_strict holds the image itself, not the images aliasing it: the alias sync and
+    // CopyImage reconcile those.
+    return !PinBlocks(image) && ImageCanRescaleUnpinned(image);
+}
+
+template <class P>
+bool TextureCache<P>::ImageCanRescaleUnpinned(ImageBase& image) {
+    if (!image.info.rescaleable || DuskShadowMap(image)) {
         return false;
     }
     if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
@@ -4211,7 +4437,7 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     image.flags |= ImageFlagBits::CheckingRescalable;
     for (const auto& alias : image.aliased_images) {
         Image& other_image = slot_images[alias.id];
-        if (!ImageCanRescale(other_image)) {
+        if (!ImageCanRescaleUnpinned(other_image)) {
             image.flags &= ~ImageFlagBits::CheckingRescalable;
             return false;
         }
@@ -4487,7 +4713,12 @@ void TextureCache<P>::TickAsyncUnswizzle() {
 }
 
 template <class P>
-bool TextureCache<P>::ScaleUp(Image& image) {
+bool TextureCache<P>::ScaleUp(Image& image, Nx2Perf::RescaleReason reason) {
+    // Not an alias sync: it runs while a draw is prepared, and a pinned alias left at 1x there
+    // makes CopyImage scale the prepared image down, dropping it from that draw.
+    if ((reason != Nx2Perf::RescaleReason::Alias && PinBlocks(image)) || DuskShadowMap(image)) {
+        return false;
+    }
     const bool has_copy = image.HasScaled();
     const bool rescaled = image.ScaleUp();
     if (!has_copy && image.HasScaled()) {
@@ -4496,18 +4727,121 @@ bool TextureCache<P>::ScaleUp(Image& image) {
     if (!rescaled) {
         return false;
     }
+    NoteRescale(image, true, reason);
     InvalidateScale(image);
     return true;
 }
 
 template <class P>
-bool TextureCache<P>::ScaleDown(Image& image) {
+bool TextureCache<P>::ScaleDown(Image& image, Nx2Perf::RescaleReason reason) {
     const bool rescaled = image.ScaleDown();
     if (!rescaled) {
         return false;
     }
+    NoteRescale(image, false, reason);
     InvalidateScale(image);
     return true;
+}
+
+template <class P>
+void TextureCache<P>::NoteRescale(Image& image, bool up, Nx2Perf::RescaleReason reason) {
+    const bool flip =
+        image.rescale_change_tick != 0 && frame_tick + 1 - image.rescale_change_tick < 120;
+    image.rescale_change_tick = frame_tick + 1;
+    image.flip_streak = flip ? image.flip_streak + 1 : 0;
+    if (!up && IsMain(image)) {
+        Nx2Perf::g_rescale_main_down.fetch_add(1, std::memory_order_relaxed);
+    }
+    Nx2Perf::NoteRescale(up, flip, reason, image.gpu_addr, image.info.size.width,
+                         image.info.size.height,
+                         [&image] { return fmt::format("{}", image.info.format); });
+}
+
+template <class P>
+void TextureCache<P>::MaybePin(Image& image) {
+    // pin_main: never the main frame, and only in gameplay (no upscale on loading screens, where
+    // 120 frames span seconds).
+    if (pin_main && (IsMain(image) || frame_tick > last_upscale_tick + 2)) {
+        return;
+    }
+    // Three changes in a row: it went down, up and down again within a few frames.
+    if (pin_active && image.flip_streak >= 3 && image.native_pin != pin_generation) {
+        image.native_pin = pin_generation;
+        if (pinned_shapes.size() >= 4096) {
+            pinned_shapes.clear();
+        }
+        pinned_shapes[image.gpu_addr] = {image.info.size.width, image.info.size.height,
+                                         image.info.format, pin_generation};
+        Nx2Perf::g_rescale_pins.fetch_add(1, std::memory_order_relaxed);
+        Nx2Perf::g_rescale_pins_total.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+template <class P>
+void TextureCache<P>::ReleasePin(Image& image) {
+    // pin_generation starts at 1 and only grows: 0 is never a current pin.
+    if (Pinned(image)) {
+        image.native_pin = 0;
+        pinned_shapes.erase(image.gpu_addr);
+        Nx2Perf::g_rescale_releases.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+template <class P>
+bool TextureCache<P>::ReleaseNearMain(std::span<const ImageId> ids) {
+    const auto valid = [](ImageId id) { return id && id != CORRUPT_ID; };
+    if (!pin_active || std::ranges::none_of(ids, [&](ImageId id) {
+            return valid(id) && IsMain(slot_images[id]);
+        })) {
+        return false;
+    }
+    bool released = false;
+    for (const ImageId id : ids) {
+        if (valid(id) && Pinned(slot_images[id])) {
+            ReleasePin(slot_images[id]);
+            released = true;
+        }
+    }
+    return released;
+}
+
+template <class P>
+bool TextureCache<P>::RaiseMainPartners(std::span<const ImageId> ids) {
+    const auto valid = [](ImageId id) { return id && id != CORRUPT_ID; };
+    if (!pin_active || std::ranges::none_of(ids, [&](ImageId id) {
+            return valid(id) && IsMain(slot_images[id]);
+        })) {
+        return false;
+    }
+    bool raise = Nx2Perf::LiveOr(Nx2Perf::g_main_partner, true);
+    for (const ImageId id : ids) {
+        if (!valid(id)) {
+            continue;
+        }
+        Image& image = slot_images[id];
+        if (ImageCanRescale(image) && !Pinned(image)) {
+            continue;
+        }
+        std::string_view why = "alias";
+        if (Pinned(image)) {
+            why = "pinned";
+        } else if (!image.info.rescaleable) {
+            why = "info";
+        } else if (DuskShadowMap(image)) {
+            why = "shadow";
+        } else if (Settings::values.resolution_info.downscale) {
+            why = "downscale";
+        }
+        // Only an image held back by its aliases can follow: the alias sync and CopyImage
+        // reconcile the scales afterwards.
+        raise &= why == "alias";
+        Nx2Perf::NotePartnerBlock(image.gpu_addr, image.info.size.width, image.info.size.height,
+                                  why, [&image] { return fmt::format("{}", image.info.format); });
+    }
+    if (raise) {
+        Nx2Perf::g_main_raised.fetch_add(1, std::memory_order_relaxed);
+    }
+    return raise;
 }
 
 template <class P>
@@ -4651,6 +4985,13 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     ForEachSparseImageInRegion(channel_state->gpu_memory.GetID(), gpu_addr, size_bytes,
                                region_check_gpu);
 
+    if (pin_active && pin_main) {
+        boost::container::small_vector<ImageId, 4> ids;
+        for (const auto& copy : join_copies_to_do) {
+            ids.push_back(copy.id);
+        }
+        ReleaseNearMain(ids);
+    }
     bool can_rescale = info.rescaleable;
     bool any_rescaled = false;
     for (const auto& copy : join_copies_to_do) {
@@ -4667,12 +5008,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     if (can_rescale) {
         for (const auto& copy : join_copies_to_do) {
             Image& sibling = slot_images[copy.id];
-            ScaleUp(sibling);
+            ScaleUp(sibling, Nx2Perf::RescaleReason::Join);
         }
     } else {
         for (const auto& copy : join_copies_to_do) {
             Image& sibling = slot_images[copy.id];
-            ScaleDown(sibling);
+            ScaleDown(sibling, Nx2Perf::RescaleReason::Join);
         }
     }
 
@@ -4869,10 +5210,14 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         RefreshContents(new_image, new_image_id);
     }
 
+    // The joined image is the main frame if one it replaces was.
+    for (const auto& copy : join_copies_to_do) {
+        new_image.main_tick = (std::max)(new_image.main_tick, slot_images[copy.id].main_tick);
+    }
     if (can_rescale) {
-        ScaleUp(new_image);
+        ScaleUp(new_image, Nx2Perf::RescaleReason::Join);
     } else {
-        ScaleDown(new_image);
+        ScaleDown(new_image, Nx2Perf::RescaleReason::Join);
     }
 
     for (size_t index = 0; index < join_copies_to_do.size(); ++index) {
@@ -4910,6 +5255,30 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         DeleteImage(copy_object.id);
     }
 
+    {
+        namespace Perf = VideoCommon::Nx2Perf;
+        const u32 width = new_image.info.size.width;
+        const u32 height = new_image.info.size.height;
+        if (!new_image.aliased_images.empty()) {
+            Perf::NoteAlias(Perf::AliasStat::CreatedAlias, width, height);
+        } else if (!join_bad_overlap_ids.empty()) {
+            Perf::NoteAlias(Perf::AliasStat::CreatedBad, width, height);
+        }
+        if (width <= 16 && height <= 16 && Perf::AliasOn(Perf::Alias::Diag) &&
+            (!new_image.aliased_images.empty() || !join_bad_overlap_ids.empty())) {
+            static u32 logged{};
+            if (logged++ < 64) {
+                LOG_INFO(HW_GPU,
+                         "Alias diag: {}x{} format {} at {:#x} ({} bytes, block {}x{}x{}): {} "
+                         "aliases, {} bad overlaps, {} joined",
+                         width, height, static_cast<u32>(new_image.info.format), gpu_addr,
+                         new_image.guest_size_bytes, new_image.info.block.width,
+                         new_image.info.block.height, new_image.info.block.depth,
+                         new_image.aliased_images.size(), join_bad_overlap_ids.size(),
+                         join_overlap_ids.size());
+            }
+        }
+    }
     RegisterImage(new_image_id);
     return new_image_id;
 }
@@ -5155,7 +5524,20 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     } else {
         base = image.TryFindBase(gpu_addr).value();
     }
-    const s32 layers = image.info.type == ImageType::e3D ? info.size.depth : info.resources.layers;
+    s32 layers = image.info.type == ImageType::e3D ? info.size.depth : info.resources.layers;
+    // The Duskbloods (as dusk-v2.5): layers come from the render target's own description. A 3D
+    // image can be bound as a layered (DefineArraySize) target, whose depth is in resources.layers,
+    // not size.depth; the game clears its 24-slice fog volumes one layer at a time this way.
+    // Other titles as build 177.
+    if (Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL) {
+        layers = static_cast<s32>(info.type == ImageType::e3D
+                                      ? info.size.depth
+                                      : static_cast<u32>(info.resources.layers));
+        if (image.info.type == ImageType::e3D) {
+            layers = (std::min)(layers,
+                                (std::max)(static_cast<s32>(image.info.size.depth) - base.layer, 1));
+        }
+    }
     if (RenderTrace::SampleFrame(frame_tick)) {
         LOG_DEBUG(HW_GPU,
                   "Render trace target match: docked={} requested={:#x} {}x{} layers={} format={} "
@@ -5388,6 +5770,14 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     image.address_space = current_address_space;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
+    if (pin_active) {
+        if (const auto it = pinned_shapes.find(image.gpu_addr);
+            it != pinned_shapes.end() && it->second.generation == pin_generation &&
+            it->second.width == image.info.size.width &&
+            it->second.height == image.info.size.height && it->second.format == image.info.format) {
+            image.native_pin = pin_generation;
+        }
+    }
 
     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
         (*channel_state->gpu_page_table)[page].push_back(image_id);
@@ -5778,12 +6168,22 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
 }
 
 template <class P>
-void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
+void TextureCache<P>::SynchronizeAliases(ImageId image_id, bool after_upload) {
+    namespace Perf = VideoCommon::Nx2Perf;
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    const u32 diag_width = image.info.size.width;
+    const u32 diag_height = image.info.size.height;
     // Nothing aliased was modified after this image: skip walking its (possibly long) alias list
     // for every draw that samples it (~7% of the GPU back thread in DK Bananza's open areas).
-    if (image.newest_alias_tick <= image.modification_tick) {
+    // The Duskbloods' tiny images (exposure and the like) skip the early-out by default, as before
+    // #858: an unverified precaution against the FSR 3.1 exposure flicker (alias_sync_always).
+    const int sync_always = Perf::AliasSync();
+    const bool walk_always =
+        sync_always > 0 || (sync_always < 0 && diag_width <= 16 && diag_height <= 16 &&
+                            Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL);
+    if (image.newest_alias_tick <= image.modification_tick && !after_upload && !walk_always) {
+        Perf::NoteAlias(Perf::AliasStat::Skipped, diag_width, diag_height);
         DEBUG_ASSERT(std::ranges::none_of(image.aliased_images, [&](const AliasedImage& alias) {
             return slot_images[alias.id].modification_tick > image.modification_tick;
         }));
@@ -5794,7 +6194,12 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     u64 most_recent_tick = image.modification_tick;
     for (const AliasedImage& aliased : image.aliased_images) {
         ImageBase& aliased_image = slot_images[aliased.id];
-        if (image.modification_tick < aliased_image.modification_tick) {
+        // alias_resync_upload: the upload just replaced what an alias of the same tick copied in.
+        const bool same_tick_gpu = after_upload &&
+                                   image.modification_tick == aliased_image.modification_tick &&
+                                   True(aliased_image.flags & ImageFlagBits::GpuModified) &&
+                                   False(aliased_image.flags & ImageFlagBits::CpuModified);
+        if (image.modification_tick < aliased_image.modification_tick || same_tick_gpu) {
             most_recent_tick = (std::max)(most_recent_tick, aliased_image.modification_tick);
             aliased_images.push_back(&aliased);
             any_rescaled |= True(aliased_image.flags & ImageFlagBits::Rescaled);
@@ -5804,14 +6209,23 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     if (aliased_images.empty()) {
         // Newer aliases were deleted since: skip the walk until one is modified again.
         image.newest_alias_tick = image.modification_tick;
+        Perf::NoteAlias(Perf::AliasStat::NoNewer, diag_width, diag_height);
         return;
+    }
+    Perf::NoteAlias(Perf::AliasStat::Synced, diag_width, diag_height);
+    if (pin_active && pin_main) {
+        boost::container::small_vector<ImageId, 9> ids{image_id};
+        for (const AliasedImage* const aliased : aliased_images) {
+            ids.push_back(aliased->id);
+        }
+        ReleaseNearMain(ids);
     }
     const bool can_rescale = ImageCanRescale(image);
     if (any_rescaled) {
         if (can_rescale) {
-            ScaleUp(image);
+            ScaleUp(image, Perf::RescaleReason::Alias);
         } else {
-            ScaleDown(image);
+            ScaleDown(image, Perf::RescaleReason::Alias);
         }
     }
     SetModificationTick(slot_images, image, most_recent_tick);
@@ -5833,11 +6247,11 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         }
         Image& aliased_image = slot_images[aliased->id];
         if (!can_rescale) {
-            ScaleDown(aliased_image);
+            ScaleDown(aliased_image, Perf::RescaleReason::Alias);
             CopyImage(image_id, aliased->id, aliased->copies);
             continue;
         }
-        ScaleUp(aliased_image);
+        ScaleUp(aliased_image, Perf::RescaleReason::Alias);
         CopyImage(image_id, aliased->id, aliased->copies);
     }
 }
@@ -5864,9 +6278,15 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             TrackImage(image, image_id);
         }
     } else {
+        const bool upload = True(image.flags & ImageFlagBits::CpuModified);
         RefreshContents(image, image_id);
         if (!image.aliased_images.empty()) {
-            SynchronizeAliases(image_id);
+            namespace Perf = VideoCommon::Nx2Perf;
+            if (upload) {
+                Perf::NoteAlias(Perf::AliasStat::Uploads, image.info.size.width,
+                                image.info.size.height);
+            }
+            SynchronizeAliases(image_id, upload && Perf::AliasOn(Perf::Alias::ResyncUpload));
         }
     }
     if (is_modification) {
@@ -5936,6 +6356,19 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     }
     // As in BlitImage: land a parked deferred clear before the copy overwrites the image.
     runtime.FlushDeferredClear();
+    // Both at one scale. Callers scale the two together, but a ScaleUp can fail (no memory for the
+    // scaled copy, or an alias that can't rescale): the copy then put 1x texels 1:1 into a 2x
+    // image, or 2x regions into a 1x one (an RX 9070 XT at 2x with little commit left: the window
+    // image's bottom turned to garbage blocks with a 1x copy of the scene inside).
+    if (True(src.flags & ImageFlagBits::Rescaled) != True(dst.flags & ImageFlagBits::Rescaled)) {
+        Image& lower = True(src.flags & ImageFlagBits::Rescaled) ? dst : src;
+        Image& higher = True(src.flags & ImageFlagBits::Rescaled) ? src : dst;
+        ReleaseNearMain(std::array{src_id, dst_id});
+        if (!(ImageCanRescale(lower) && ScaleUp(lower, Nx2Perf::RescaleReason::Copy))) {
+            ScaleDown(higher, Nx2Perf::RescaleReason::Copy);
+        }
+        Nx2Perf::g_rescale_mismatches.fetch_add(1, std::memory_order_relaxed);
+    }
     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));

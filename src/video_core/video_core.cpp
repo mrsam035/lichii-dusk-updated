@@ -69,7 +69,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::MmeCapture::StartSession();
     VideoCore::AsyncReadback::ReadSwitch();
     VideoCommon::Nx2Perf::ReadSwitch();
-    VideoCommon::BackX::ReadSwitch();
+    VideoCommon::BackX::ReadSwitch(Settings::GetCurrentProgramID());
     VideoCommon::Nx2DrainCheck::ReadSwitch();
     Core::GPUDirtyMemoryManager::count_collects = VideoCommon::BackX::g_verify;
     Tegra::Nx2ListIndirect::Stats::ReadSwitch();

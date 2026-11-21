@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <optional>
 #include <source_location>
 #include <string_view>
@@ -21,6 +22,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/oot_network.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/rasterizer_interface.h"
@@ -178,7 +180,10 @@ public:
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter,
                                    std::array<f32, 2> motion_scale, bool use_history,
-                                   std::optional<std::array<u32, 2>> render_region) override;
+                                   std::optional<std::array<u32, 2>> render_region,
+                                   bool depth_from_draws) override;
+    std::optional<DuskDrawTargets> TakeDuskDrawTargets() override;
+    void DropDuskDrawTargets() override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
@@ -217,10 +222,15 @@ private:
     /// Remembers render target 0 of a draw that can hold Ocarina of Time's tonemapped image.
     void TrackOotTonemappedImage();
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
+    /// The Duskbloods: remembers the draw's velocity target and its depth (TakeDuskDrawTargets).
+    void TrackDuskDrawTargets();
 
     void FlushWork();
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
+    [[nodiscard]] bool DebugSkipsDraw(u32 index, const GraphicsPipeline& pipeline) const;
+    void RecordDebugDraw(u32 index, bool is_indexed, bool is_indirect, bool skipped,
+                         const GraphicsPipeline& pipeline);
 
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
@@ -335,6 +345,15 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    struct DuskTrackedTargets {
+        Tegra::Engines::Fermi2D::Surface velocity{}; ///< address 0: nothing tracked
+        bool has_depth{};
+        Tegra::Engines::Maxwell3D::Regs::Zeta zeta{};
+        Tegra::Engines::Maxwell3D::Regs::ZetaSize zeta_size{};
+        Tegra::Texture::MsaaMode msaa{};
+        bool fresh{}; ///< drawn since the last take
+        std::optional<std::chrono::steady_clock::time_point> last_taken;
+    } dusk_targets;
     std::optional<u64> oot_camera_sample_frame;
     /// Why this frame's largest scene-target draw with a camera buffer gave no camera.
     struct OcarinaCameraRefusal {
@@ -389,6 +408,12 @@ private:
         std::array<f32, 4> origin{};
         std::array<f32, 280 * 12> bones{};
     } oot_actor, oot_previous_actor;
+    /// Debug server draw_skip / EDEN_NX2_DRAW_SKIP, and the index of the next draw in this frame.
+    std::optional<VideoCore::Nx2Debug::DrawFilter> draw_filter;
+    u32 debug_draw_index = 0;
+    /// Debug server draw_list: the request being recorded this frame, and its draws.
+    std::optional<u64> draw_list_id;
+    std::vector<VideoCore::Nx2Debug::DrawRecord> draw_list;
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;

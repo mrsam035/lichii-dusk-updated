@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -22,6 +24,8 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/dlss_mode.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/present.h"
 #include "video_core/render_trace.h"
@@ -143,6 +147,206 @@ VkSurfaceFormatKHR ChooseOutputFormat(const vk::PhysicalDevice& physical, VkSurf
 #endif
 }
 
+/// Frame generation shows its frames only while the real frame rate is at least
+/// EDEN_NX2_FG_MIN_FPS (default 40; 0 always): below it the generated frames carry large
+/// interpolation errors and add latency. It opens again 10 FPS higher, so it does not flap.
+bool FrameGenGateOpen(f32 interval_s) {
+    static const f32 min_fps = [] {
+        const char* const value = std::getenv("EDEN_NX2_FG_MIN_FPS");
+        return value ? static_cast<f32>(std::strtod(value, nullptr)) : 40.0f;
+    }();
+    static bool open = true;
+    if (min_fps <= 0.0f || interval_s <= 0.0f) {
+        return open = true;
+    }
+    const f32 fps = 1.0f / interval_s;
+    const bool next = open ? fps >= min_fps : fps >= min_fps + 10.0f;
+    if (next != open) {
+        LOG_INFO(Render_Vulkan, "Frame generation {} at {:.1f} real FPS (gate {:.0f}-{:.0f} FPS)",
+                 next ? "resumes" : "pauses", fps, min_fps, min_fps + 10.0f);
+    }
+    return open = next;
+}
+
+/// Settings that do nothing or harm on this setup, once per session (frame generation once its
+/// state is known).
+void LogSetupWarnings(const Device& device, VideoCore::FrameGenState frame_gen_state) {
+    const auto& v = Settings::values;
+    const u64 program_id = Settings::GetCurrentProgramID();
+    const bool scaled = v.resolution_info.up_scale > (1U << v.resolution_info.down_shift);
+    static bool logged = false;
+    if (!std::exchange(logged, true)) {
+        std::vector<std::string> warnings;
+        if (v.nvidia_dlss.GetValue() && !device.IsNvidia()) {
+            warnings.emplace_back("NVIDIA DLSS is on but the GPU is not NVIDIA: ignored, FSR 3.1 "
+                                  "runs");
+        }
+        if (v.amd_fsr4.GetValue() && program_id != 0x0400486024DEC000ULL) {
+            warnings.emplace_back("AMD FSR 4 is on but this game has no FSR 4 path: ignored");
+        }
+        if (program_id == VideoCommon::DlssMode::DuskbloodsProgramId && !Settings::IsDockedMode() &&
+            scaled) {
+            warnings.emplace_back("The Duskbloods in handheld mode above 1x is untested (it "
+                                  "renders a smaller region there); docked is the tested setup");
+        }
+        if (v.scaling_filter.GetValue() == Settings::ScalingFilter::NearestNeighbor && scaled) {
+            warnings.emplace_back("Nearest neighbour window filter above 1x: the frame is "
+                                  "area-sampled when it is larger than the window; Bilinear or "
+                                  "Area look the same there and smoother when it is smaller");
+        }
+        for (const std::string& warning : warnings) {
+            LOG_WARNING(Render_Vulkan, "Setup warning: {}", warning);
+        }
+    }
+    static bool frame_gen_logged = false;
+    if (v.frame_gen.GetValue() && !frame_gen_logged &&
+        frame_gen_state != VideoCore::FrameGenState::Pending) {
+        frame_gen_logged = true;
+        const char* reason = nullptr;
+        switch (frame_gen_state) {
+        case VideoCore::FrameGenState::UnsupportedGpu:
+            reason = "this GPU lacks features LSFG needs (16-bit floats, Vulkan memory model, null "
+                     "descriptors); the FSR3 frame generation type does not need them";
+            break;
+        case VideoCore::FrameGenState::MissingLosslessDll:
+            reason = "Lossless.dll is missing; the FSR3 frame generation type does not need it";
+            break;
+        case VideoCore::FrameGenState::UnsupportedSurface:
+            reason = "the window's swapchain format can't be written from a shader";
+            break;
+        case VideoCore::FrameGenState::UnsupportedBuild:
+            reason = "this build has no frame generation";
+            break;
+        default:
+            break;
+        }
+        if (reason) {
+            LOG_WARNING(Render_Vulkan, "Setup warning: frame generation is on but unavailable: {}",
+                        reason);
+        }
+    }
+}
+
+/// Every frame interval of the session in 0.1 ms buckets (the last one: 2 s or more), for the
+/// "Nx2Summary run" line when the game stops.
+struct RunFrames {
+    static constexpr size_t Buckets = 20001;
+    std::array<u32, Buckets> histogram{};
+    u64 frames{};
+    double sum_ms{};
+    u64 over_100ms{};
+    float longest_ms{};
+
+    void Add(float ms) {
+        ++histogram[(std::min)(static_cast<size_t>(ms * 10.0f), Buckets - 1)];
+        ++frames;
+        sum_ms += ms;
+        over_100ms += ms > 100.0f ? 1 : 0;
+        longest_ms = (std::max)(longest_ms, ms);
+    }
+
+    /// The frame time `share` of the frames reach or exceed.
+    [[nodiscard]] double Slowest(double share) const {
+        const u64 target = (std::max)(u64{1}, static_cast<u64>(static_cast<double>(frames) * share));
+        u64 seen{};
+        for (size_t bucket = Buckets; bucket-- > 0;) {
+            seen += histogram[bucket];
+            if (seen >= target) {
+                return static_cast<double>(bucket) / 10.0;
+            }
+        }
+        return 0.0;
+    }
+};
+
+RunFrames& Run() {
+    static RunFrames run;
+    return run;
+}
+
+/// "Nx2Summary run:" once, when the game stops: the session's average and 1% / 0.1% lows (the
+/// frame rate of the slowest 1% and 0.1% of frames), whatever the switches.
+void LogRunSummary() {
+    const RunFrames& run = Run();
+    if (run.frames == 0 || run.sum_ms <= 0.0) {
+        return;
+    }
+    const auto fps = [](double ms) { return ms > 0.0 ? 1000.0 / ms : 0.0; };
+    LOG_INFO(Render_Vulkan,
+             "Nx2Summary run: {:.0f} s, {} frames, average {:.1f} fps, 1% low {:.1f} fps, 0.1% low "
+             "{:.1f} fps, {} frames over 100 ms, longest {:.0f} ms",
+             run.sum_ms / 1000.0, run.frames, fps(run.sum_ms / static_cast<double>(run.frames)),
+             fps(run.Slowest(0.01)), fps(run.Slowest(0.001)), run.over_100ms, run.longest_ms);
+    Run() = RunFrames{}; // the next game starts over
+}
+
+/// "Nx2Summary perf:" every 10 s (GPU thread, at each present): what a report needs to judge the
+/// frame rate and the image without other switches.
+void LogPerfSummary(Scheduler& scheduler, const VideoCore::DlssStatus& dlss, u64 generated) {
+    namespace Perf = VideoCommon::Nx2Perf;
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point start{};
+    static Clock::time_point last{};
+    static std::vector<float> intervals;
+    static u64 generated_frames{};
+    static u64 dlss_evaluations{};
+    const Clock::time_point now = Clock::now();
+    if (last != Clock::time_point{}) {
+        intervals.push_back(std::chrono::duration<float, std::milli>(now - last).count());
+        Run().Add(intervals.back());
+    } else {
+        start = now;
+        dlss_evaluations = dlss.evaluations;
+    }
+    last = now;
+    generated_frames += generated;
+    if (now - start < std::chrono::seconds{10} || intervals.empty()) {
+        return;
+    }
+    std::vector<float> sorted = intervals;
+    std::ranges::sort(sorted);
+    const double frames = static_cast<double>(sorted.size());
+    double sum{};
+    for (const float value : sorted) {
+        sum += value;
+    }
+    const float p99 = sorted[static_cast<size_t>(frames * 0.99) < sorted.size()
+                                 ? static_cast<size_t>(frames * 0.99)
+                                 : sorted.size() - 1];
+    const u64 sync_ns = Perf::g_sync_submit_wait_ns.exchange(0, std::memory_order_relaxed);
+    const u64 sync_waits = Perf::g_sync_submit_waits.exchange(0, std::memory_order_relaxed);
+    const u64 upscales = Perf::g_upscales.exchange(0, std::memory_order_relaxed);
+    const u64 resets = Perf::g_upscale_resets.exchange(0, std::memory_order_relaxed);
+    const bool dlss_ran = dlss.evaluations > dlss_evaluations;
+    std::string upscaler = "none";
+    if (upscales != 0) {
+        upscaler = dlss_ran ? fmt::format("DLSS {} preset {}", Settings::CanonicalizeEnum(dlss.mode),
+                                          Settings::CanonicalizeEnum(dlss.preset))
+                            : std::string{"FSR 3.1"};
+    }
+    const Scheduler::GpuSplit gpu = scheduler.TakeGpuSplit();
+    const std::string gpu_text =
+        gpu.frames == 0 ? std::string{"n/a"}
+                        : fmt::format("pre {:.2f} upscale {:.2f} (max {:.2f}) post {:.2f} over {} frames",
+                                      gpu.pre_ms, gpu.upscale_ms, gpu.upscale_max_ms,
+                                      gpu.post_ms, gpu.frames);
+    LOG_INFO(Render_Vulkan,
+             "Nx2Summary perf: {:.1f} s, {} frames, frame ms avg {:.2f} p99 {:.2f} max {:.2f}; "
+             "sync submit wait {:.2f} ms/frame ({} waits); upscaler {} ({} upscales, {} history "
+             "resets); GPU ms/frame {}; generated frames {:.0f}%; commit left {} "
+             "MiB",
+             std::chrono::duration<double>(now - start).count(), sorted.size(), sum / frames, p99,
+             sorted.back(), static_cast<double>(sync_ns) / 1e6 / frames, sync_waits, upscaler,
+             upscales, resets, gpu_text,
+             100.0 * static_cast<double>(generated_frames) /
+                 (frames + static_cast<double>(generated_frames)),
+             Perf::g_commit_left_mib.load(std::memory_order_relaxed));
+    intervals.clear();
+    generated_frames = 0;
+    dlss_evaluations = dlss.evaluations;
+    start = now;
+}
+
 } // Anonymous namespace
 
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld, VkSurfaceKHR surface) {
@@ -224,9 +428,25 @@ try
 #endif
 {
 
-    if (Settings::values.renderer_force_max_clock.GetValue() && device.ShouldBoostClocks()) {
-        turbo_mode.emplace(instance, dld);
-        scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
+    // Force maximum clocks (off by default): a second device keeps the GPU busy. Its device
+    // failing to start skips it instead of failing the whole renderer ("Vulkan initialization
+    // error" and no boot). Fritchii a813290651.
+    if (!Settings::values.renderer_force_max_clock.GetValue()) {
+        LOG_INFO(Render_Vulkan, "Force maximum clocks: off");
+    } else if (!device.ShouldBoostClocks()) {
+        LOG_INFO(Render_Vulkan, "Force maximum clocks: skipped (driver not on the list, Steam "
+                                "Deck, or a debugging tool attached)");
+    } else {
+        try {
+            turbo_mode.emplace(instance, dld);
+            scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
+            LOG_INFO(Render_Vulkan, "Force maximum clocks: running (costs power; not for laptops "
+                                    "on battery)");
+        } catch (const std::exception& exception) {
+            turbo_mode.reset();
+            LOG_WARNING(Render_Vulkan, "Force maximum clocks: skipped (its device failed: {})",
+                        exception.what());
+        }
     }
 
 #ifdef HAS_RESHADE
@@ -275,6 +495,7 @@ try
 }
 
 RendererVulkan::~RendererVulkan() {
+    LogRunSummary();
     scheduler.RegisterOnSubmit([] {});
 #ifdef HAS_FLYHIGH
     frame_gen.DrainFlyHighSubmissions();
@@ -323,6 +544,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
                               render_window.GetFramebufferLayout(),
                               present_manager.SwapchainImageCount(), output_format.format, output);
+    scheduler.MarkGpu(Scheduler::GpuMark::Present);
+    u64 perf_generated = 0;
 
 #ifdef HAS_LSFG
     void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames(),
@@ -331,7 +554,9 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 
     frame_gen.Process(device, frame, frame->image_format, GuestExtent(framebuffers));
 
-    const size_t generated_frames = frame_gen.GeneratedFrameCount();
+    const size_t generated_frames =
+        FrameGenGateOpen(frame_gen.FrameInterval()) ? frame_gen.GeneratedFrameCount() : 0;
+    perf_generated = generated_frames;
     // Each generated frame keeps the screen for an equal share of the real frame interval. Sent
     // back to back, a high refresh rate display shows it for one refresh only.
     const auto spacing = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -351,6 +576,12 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     }
 #endif
 
+    LogPerfSummary(scheduler, GetDlssStatus(), perf_generated);
+#ifdef HAS_LSFG
+    LogSetupWarnings(device, frame_gen.CurrentStatus().state);
+#else
+    LogSetupWarnings(device, VideoCore::FrameGenState::UnsupportedBuild);
+#endif
     if (const auto mark = scheduler.NextFrameMark(); mark != Scheduler::FrameMark::None) {
         scheduler.MarkFrameEnd(++trace_frame, mark);
     }

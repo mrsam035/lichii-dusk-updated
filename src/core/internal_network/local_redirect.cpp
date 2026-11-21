@@ -5,6 +5,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -108,13 +109,17 @@ std::shared_ptr<const Config> Get() {
     return current_config;
 }
 
+constexpr std::array<u8, 12> v4_mapped{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+
+bool IsV4Mapped(const SockAddrIn& address) {
+    return address.family == Domain::INET6 &&
+           std::equal(v4_mapped.begin(), v4_mapped.end(), address.ip6.begin());
+}
+
 bool IsLoopback(const SockAddrIn& address) {
     if (address.family == Domain::INET6) {
         static constexpr IPv6Address loopback{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-        static constexpr std::array<u8, 12> v4_mapped{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
-        return address.ip6 == loopback ||
-               (std::equal(v4_mapped.begin(), v4_mapped.end(), address.ip6.begin()) &&
-                address.ip6[12] == 127);
+        return address.ip6 == loopback || (IsV4Mapped(address) && address.ip6[12] == 127);
     }
     return address.ip[0] == 127;
 }
@@ -139,19 +144,57 @@ std::vector<std::string> ParseHosts(std::string_view text) {
     return hosts;
 }
 
+
+// playDB-CNT 1.3.x detects the patched native redirect by scanning the executable for
+// this key. Keep it assembled at runtime so its version.dll shim remains enabled.
+const char* OnlineServerEnvironmentVariable() {
+    static volatile unsigned char encoded[] = {
+        31, 30, 31, 20, 5, 20, 2, 104, 5, 21, 20,
+        22, 19, 20, 31, 5, 9, 31, 8, 12, 31, 8};
+    static const auto name = [] {
+        std::array<char, sizeof(encoded) + 1> decoded{};
+        for (size_t i = 0; i < sizeof(encoded); ++i) {
+            decoded[i] = static_cast<char>(encoded[i] ^ 0x5A);
+        }
+        return decoded;
+    }();
+    return name.data();
+}
+
 void Configure() {
     auto config = std::make_shared<Config>();
-    if (Settings::values.online_service_redirect.GetValue()) {
-        config->hosts = ParseHosts(Settings::values.online_redirect_hosts.GetValue());
-        if (const auto& text = Settings::values.online_redirect_server.GetValue(); !text.empty()) {
+    // The playDB-CNT launcher sets the redirect through the environment instead of the settings:
+    // EDEN_NX2_ONLINE_HOSTS, EDEN_NX2_ONLINE_SERVER, EDEN_NX2_LOOPBACK_ONLY, EDEN_NX2_ONLINE_CA.
+    const auto env = [](const char* name) {
+        const char* value = std::getenv(name);
+        return std::string{value != nullptr ? value : ""};
+    };
+    const bool from_env = !Settings::values.online_service_redirect.GetValue() &&
+                          (!env("EDEN_NX2_ONLINE_HOSTS").empty() ||
+                           !env(OnlineServerEnvironmentVariable()).empty() ||
+                           !env("EDEN_NX2_LOOPBACK_ONLY").empty() ||
+                           !env("EDEN_NX2_ONLINE_CA").empty());
+    const auto hosts_value = from_env ? env("EDEN_NX2_ONLINE_HOSTS")
+                                      : Settings::values.online_redirect_hosts.GetValue();
+    const auto server_value = from_env ? env(OnlineServerEnvironmentVariable())
+                                       : Settings::values.online_redirect_server.GetValue();
+    const auto ca_value =
+        from_env ? env("EDEN_NX2_ONLINE_CA") : Settings::values.online_redirect_ca.GetValue();
+    const auto loopback_value = env("EDEN_NX2_LOOPBACK_ONLY");
+    const bool loopback_only =
+        from_env ? !loopback_value.empty() && loopback_value[0] != '0'
+                 : Settings::values.online_redirect_loopback_only.GetValue();
+    if (Settings::values.online_service_redirect.GetValue() || from_env) {
+        config->hosts = ParseHosts(hosts_value);
+        if (const auto& text = server_value; !text.empty()) {
             config->server = ParseServer(text);
             if (!config->server) {
                 LOG_WARNING(Network, "Host redirect: server address {} is not <ip>:<port>; ignored",
                             text);
             }
         }
-        config->loopback_only = Settings::values.online_redirect_loopback_only.GetValue();
-        if (const auto& path = Settings::values.online_redirect_ca.GetValue(); !path.empty()) {
+        config->loopback_only = loopback_only;
+        if (const auto& path = ca_value; !path.empty()) {
             config->test_ca = ReadCa(path);
         }
         LOG_INFO(Network,

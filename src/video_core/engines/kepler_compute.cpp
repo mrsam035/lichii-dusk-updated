@@ -884,6 +884,7 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
         dlss_chain.dispatches = 0;
+        dlss_chain.skipped_this_eval = false;
         dlss_chain.pending.clear();
     }
     if (!dlss_chain.active) {
@@ -904,14 +905,29 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
         dlss_chain.failure == VideoCore::GameDlssReason::OutputMismatch &&
         blocker == VideoCore::GameDlssReason::None && !DlssNetworkDroppedForGood();
     if (dlss_chain.output_pass) {
-        return replacement && !recheck_after_dispatch && FinishDlssEvaluation();
+        // When this evaluation skipped passes for a replacement that then failed, the game's
+        // output pass would read inputs not written this frame; it is skipped too, so the last
+        // output stays one more frame. replacement_drew is now false, so the next evaluation
+        // runs the whole network.
+        return (replacement && !recheck_after_dispatch && FinishDlssEvaluation()) ||
+               dlss_chain.skipped_this_eval;
     }
     // While the network can't be shown at all (turned off or replaced on request, resolution
     // scaling, no support), its own passes are skipped like a network dropped for good: the
     // replacement draws over their result anyway, and a pass that can't run (tensor operations
     // unavailable) would drop the prepass's jitter, motion vectors and depth the replacement needs.
-    return (blocker != VideoCore::GameDlssReason::None || DlssNetworkDroppedForGood()) &&
-           !passes->IsPrepass(native_key) && dlss_chain.programs.contains(native_key);
+    // The Duskbloods also skips them while the replacement draws (Fire Emblem keeps running the
+    // network until it fails its checks).
+    const bool replacement_will_draw = dlss_chain.render_region && replacement &&
+                                       dlss_chain.replacement_drew && fe_upscale_jitter.Has();
+    const bool failed = dlss_chain.failure != VideoCore::GameDlssReason::None;
+    const bool skip = (blocker != VideoCore::GameDlssReason::None || DlssNetworkDroppedForGood() ||
+                       failed || replacement_will_draw) &&
+                      !passes->IsPrepass(native_key) && dlss_chain.programs.contains(native_key);
+    if (skip && !failed) {
+        dlss_chain.skipped_this_eval = true;
+    }
+    return skip;
 }
 
 // The game's own DLSS network (its translated programs) is shown once every pass of an
@@ -1166,9 +1182,11 @@ bool KeplerCompute::FinishDlssEvaluation() {
         dlss_motion_vectors.reset();
         dlss_depth.reset();
         (void)fe_upscale_jitter.Take();
+        dlss_chain.replacement_drew = false;
         return false;
     }
-    return TryFireEmblemUpscale();
+    dlss_chain.replacement_drew = TryFireEmblemUpscale();
+    return dlss_chain.replacement_drew;
 }
 
 // Logs the images a rejected program's handles (constant bank 0, bytes 0x80-0x11c) point to, so a
@@ -1500,6 +1518,17 @@ void KeplerCompute::RememberDlssMotionVectors() {
         depth->srgb_conversion != 0);
     if (depth_format && VideoCommon::DlssContract::IsUpscalerDepthFormat(*depth_format)) {
         dlss_depth = *depth;
+    } else {
+        dlss_depth.reset();
+        static bool logged{};
+        if (dlss_chain.render_region && !std::exchange(logged, true)) {
+            LOG_INFO(HW_GPU, "Duskbloods prepass depth (+{:#x}) not taken: {}", depth_offset,
+                     depth ? fmt::format("{:#x} {}x{} format {:#x} type {}", depth->Address(),
+                                         depth->Width(), depth->Height(),
+                                         static_cast<u32>(depth->format.Value()),
+                                         static_cast<u32>(depth->r_type.Value()))
+                           : std::string{"unreadable"});
+        }
     }
 }
 
@@ -1617,44 +1646,182 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
+    // Only The Duskbloods renders a region (CapturedPasses), so what follows is its own.
+    // EDEN_NX2_DUSK_JITTER=output (default) takes the jitter from this pass's constants, x at
+    // +0x38c and y at +0x388 in render pixels; =prepass keeps the first pass's +0x1b0.
+    static const bool output_jitter = [] {
+        const char* const value = std::getenv("EDEN_NX2_DUSK_JITTER");
+        return !(value && std::string_view{value} == "prepass");
+    }();
+    // EDEN_NX2_DUSK_MV=siko (default): the velocity is in render heights on both axes, so x is
+    // scaled by the height too; =upstream scales each axis by its own render size.
+    static const bool siko_motion = [] {
+        const char* const value = std::getenv("EDEN_NX2_DUSK_MV");
+        return !(value && std::string_view{value} == "upstream");
+    }();
+    const std::array<f32, 2> pass_jitter{
+        std::bit_cast<f32>(memory_manager.Read<u32>(constants + 0x38c)),
+        std::bit_cast<f32>(memory_manager.Read<u32>(constants + 0x388))};
+    // Not range checked as tightly as the first pass's (siko's resolve takes it as is); only
+    // values no jitter can have are dropped.
+    const bool pass_jitter_valid = std::isfinite(pass_jitter[0]) && std::isfinite(pass_jitter[1]) &&
+                                   std::abs(pass_jitter[0]) <= 1.0f &&
+                                   std::abs(pass_jitter[1]) <= 1.0f;
+    std::optional<std::array<f32, 2>> used_jitter;
+    if (output_jitter && pass_jitter_valid) {
+        used_jitter = pass_jitter;
+    } else if (jitter) {
+        used_jitter = jitter->offset;
+    }
+    static u32 jitter_logged{};
+    if (jitter_logged < 4) {
+        ++jitter_logged;
+        LOG_INFO(HW_GPU, "Duskbloods jitter: prepass {} output {:.4f},{:.4f}{} using {}",
+                 jitter ? fmt::format("{:.4f},{:.4f}", jitter->offset[0], jitter->offset[1])
+                        : std::string{"none"},
+                 pass_jitter[0], pass_jitter[1], pass_jitter_valid ? "" : " (invalid)",
+                 !used_jitter                                ? "none"
+                 : output_jitter && pass_jitter_valid        ? "output"
+                                                             : "prepass");
+    }
+    // EDEN_NX2_DUSK_INPUTS=draw (default): the motion vectors and depth are the velocity render
+    // target and the depth target its draws used, as siko's v31 feeds FSR (the prepass's depth is
+    // not D32 float, so FSR never ran on it); =prepass keeps the first pass's +0x290 and +0x288.
+    static const bool draw_inputs = [] {
+        const char* const value = std::getenv("EDEN_NX2_DUSK_INPUTS");
+        return !(value && std::string_view{value} == "prepass");
+    }();
+    const auto tracked = draw_inputs ? rasterizer->TakeDuskDrawTargets() : std::nullopt;
+    // v31's checks: the velocity is the colour's size (R16G16 float as tracked) with a depth.
+    const bool tracked_valid = tracked && tracked->depth != 0 &&
+                               tracked->velocity.width == input->Width() &&
+                               tracked->velocity.height == input->Height();
     // Without this evaluation's jitter or usable motion vectors (a rejected pass clears them), the
     // region is still scaled, without history, rather than leaving the network's output.
-    const bool use_history = jitter && motion && width <= motion->Width() &&
-                             height <= motion->Height();
-    // A depth too small for the region is left out; history still runs (on the stand-in).
-    const bool depth_fits = depth && width <= depth->Width() && height <= depth->Height();
-    Fermi2D::Surface motion_surface{};
-    if (use_history) {
-        motion_surface = surface(*motion);
-        motion_surface.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
-    }
-    // Measured: the vectors at cb0+0x290 are in output pixels and point to the previous position
-    // (prev = cur + mv); the raw cb0+0x284 buffer has the opposite sign (the prepass scales it by -1080).
-    const std::array<f32, 2> motion_scale =
-        use_history ? std::array{1.0f / static_cast<f32>(output->Width()),
-                                 1.0f / static_cast<f32>(output->Height())}
-                    : std::array{0.0f, 0.0f};
-    const auto upscale = [&](bool history, const Texture::TICEntry* upscale_depth) {
+    const bool prepass_history =
+        used_jitter && motion && width <= motion->Width() && height <= motion->Height() &&
+        (!depth || (width <= depth->Width() && height <= depth->Height()));
+    // The game's motion vectors point from the previous position to the current one (a rightward
+    // pan gives negative x while the scene moves left), the reverse of what the upscale expects.
+    // The runtime multiplies the scale by the render size.
+    const f32 motion_x =
+        siko_motion ? -static_cast<f32>(height) / static_cast<f32>(width) : -1.0f;
+    const auto upscale = [&](bool from_draws) {
+        const bool use_history = from_draws ? used_jitter.has_value() : prepass_history;
+        Fermi2D::Surface motion_surface{};
+        if (use_history && from_draws) {
+            motion_surface = tracked->velocity;
+        } else if (use_history) {
+            motion_surface = surface(*motion);
+            motion_surface.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
+        }
+        const std::array<f32, 2> motion_scale =
+            use_history ? std::array{motion_x, -1.0f} : std::array{0.0f, 0.0f};
+        static u32 last_source = ~0U;
+        static u32 sources_logged{};
+        constexpr std::array<const char*, 3> source_names{"none", "draw", "prepass"};
+        const u32 source_index = !use_history ? 0U : from_draws ? 1U : 2U;
+        const char* const source = source_names[source_index];
+        if (source_index != last_source && sources_logged < 4) {
+            last_source = source_index;
+            ++sources_logged;
+            const auto describe = [](const std::optional<Texture::TICEntry>& tic) {
+                return tic ? fmt::format("{:#x} {}x{} format {:#x} type {}", tic->Address(),
+                                         tic->Width(), tic->Height(),
+                                         static_cast<u32>(tic->format.Value()),
+                                         static_cast<u32>(tic->r_type.Value()))
+                           : std::string{"none"};
+            };
+            LOG_INFO(HW_GPU,
+                     "Duskbloods inputs: using {} (EDEN_NX2_DUSK_INPUTS={}); tracked: velocity {}, "
+                     "depth {}; prepass: motion (+0x290) {}, depth (+0x288) {}; render {}x{}, "
+                     "output {}x{}, motion scale {:.4f},{:.4f}",
+                     source, draw_inputs ? "draw" : "prepass",
+                     tracked ? fmt::format("{:#x} {}x{} R16G16_FLOAT",
+                                           tracked->velocity.Address(), tracked->velocity.width,
+                                           tracked->velocity.height)
+                             : std::string{"none"},
+                     tracked && tracked->depth
+                         ? fmt::format("{:#x} {}x{} depth format {:#x}", tracked->depth,
+                                       tracked->depth_width, tracked->depth_height,
+                                       tracked->depth_format)
+                         : std::string{"none"},
+                     describe(motion), describe(depth), width, height, output->Width(),
+                     output->Height(), motion_scale[0], motion_scale[1]);
+        }
         return rasterizer->AccelerateTemporalUpscale(
-            surface(*input), surface(*output), history ? motion_surface : Fermi2D::Surface{},
-            upscale_depth, jitter ? jitter->offset : std::array{0.0f, 0.0f},
-            history ? motion_scale : std::array{0.0f, 0.0f}, history, std::array{width, height});
+            surface(*input), surface(*output), motion_surface,
+            use_history && !from_draws && depth ? &*depth : nullptr,
+            used_jitter.value_or(std::array{0.0f, 0.0f}), motion_scale, use_history,
+            std::array{width, height}, use_history && from_draws);
     };
-    // Each refusal drops one input: the depth (it can be refused after it was prepared), then the
-    // history, which leaves the spatial draw the region always had.
-    bool done = use_history && depth_fits && upscale(true, &*depth);
-    if (!done && use_history) {
-        done = upscale(true, nullptr);
+    bool done = false;
+    if (tracked_valid) {
+        done = upscale(true);
+        if (!done) {
+            // Never reuse targets the upscale declined; this frame takes the prepass inputs.
+            rasterizer->DropDuskDrawTargets();
+            static u32 declines{};
+            if (declines++ < 4) {
+                LOG_WARNING(HW_GPU, "Duskbloods: upscale declined the drawn velocity/depth; "
+                                    "using the prepass inputs");
+            }
+        }
     }
     if (!done) {
-        done = upscale(false, nullptr);
+        done = upscale(false);
     }
+    if (done) {
+        // The output pass also fills the RGBA16F images at +0x350 and +0x330 (read by the
+        // reflections and the next frame); it is skipped, so fill them with the result.
+        const Fermi2D::Config copy{
+            .operation = Fermi2D::Operation::SrcCopy,
+            .filter = Fermi2D::Filter::Point,
+            .must_accelerate = true,
+            .dst_x0 = 0,
+            .dst_y0 = 0,
+            .dst_x1 = static_cast<s32>(output->Width()),
+            .dst_y1 = static_cast<s32>(output->Height()),
+            .src_x0 = 0,
+            .src_y0 = 0,
+            .src_x1 = static_cast<s32>(output->Width()),
+            .src_y1 = static_cast<s32>(output->Height()),
+        };
+        for (const u32 offset : {0x350U, 0x330U}) {
+            const auto history = ConstBuffer0Image(offset);
+            if (!history || history->format != Texture::TextureFormat::R16G16B16A16 ||
+                history->r_type != Texture::ComponentType::FLOAT || history->Address() == 0 ||
+                !history->IsBlockLinear() ||
+                history->Address() == output->Address() ||
+                history->Address() == input->Address() || history->Width() != output->Width() ||
+                history->Height() != output->Height()) {
+                static bool warned{};
+                if (!std::exchange(warned, true)) {
+                    LOG_WARNING(HW_GPU, "Duskbloods: history image at +{:#x} unexpected ({}); "
+                                        "not filled", offset,
+                                history ? fmt::format("format {:#x} {}x{}",
+                                                      static_cast<u32>(history->format.Value()),
+                                                      history->Width(), history->Height())
+                                        : std::string{"unreadable"});
+                }
+                continue;
+            }
+            auto destination = surface(*history);
+            destination.format = Tegra::RenderTargetFormat::R16G16B16A16_FLOAT;
+            (void)rasterizer->AccelerateSurfaceCopy(surface(*output), destination, copy);
+        }
+    }
+    // Dynamic resolution changes the width often; only the first changes are logged.
+    constexpr u32 max_width_logs = 8;
     static u32 last_width{};
-    if (width != last_width) {
+    static u32 width_logs{};
+    if (width != last_width && width_logs < max_width_logs) {
         last_width = width;
-        LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}",
+        ++width_logs;
+        LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}{}",
                  done ? "scaled" : "could not scale", width, height, input->Width(),
-                 input->Height(), output->Width(), output->Height());
+                 input->Height(), output->Width(), output->Height(),
+                 width_logs == max_width_logs ? " (further region changes are not logged)" : "");
     }
     return done;
 }

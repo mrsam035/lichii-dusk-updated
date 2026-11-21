@@ -29,6 +29,7 @@
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
+#include "video_core/renderer_vulkan/pass_label.h"
 #include "video_core/renderer_vulkan/frame_pacer.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -100,6 +101,39 @@ public:
     }
     /// Host GPU busy time of the last sampled frame, nullopt when none was taken in 3 s.
     [[nodiscard]] std::optional<double> GpuBusyMs() const;
+
+    /// GPU time around a temporal upscaler: timestamps at its start and end and at each present.
+    enum class GpuMark : u8 { UpscaleBegin, UpscaleEnd, Present };
+    /// Recording thread: timestamps this point of the frame (cheap; nothing waits on it).
+    void MarkGpu(GpuMark mark);
+    /// GPU ms per frame since the last call, for frames that ran an upscaler: before it (from the
+    /// previous present), the upscaler itself, and after it up to the present. GPU wall time,
+    /// which is the GPU's work when the GPU is the bottleneck.
+    struct GpuSplit {
+        u64 frames{};
+        double pre_ms{};
+        double upscale_ms{};
+        double post_ms{};
+        double upscale_max_ms{};
+    };
+    [[nodiscard]] GpuSplit TakeGpuSplit();
+
+    /// Per-pass GPU timing (pass_timing): one frame every 2 s gets a timestamp where each render
+    /// pass, run of dispatches or upscale starts; a few presents later the "Nx2Pass GPU" line
+    /// names the 8 costliest targets and compute shaders of that frame.
+    /// PassDispatch: recording thread, a native dispatch of this compute shader.
+    void PassDispatch(u64 hash) {
+        if (pass_sampling) [[unlikely]] {
+            PassNoteDispatch(hash);
+        }
+    }
+    /// PassRescale: recording thread, a resolution-scale copy of an image starts (true) or ends.
+    void PassRescale(bool begin) {
+        if (pass_sampling) [[unlikely]] {
+            PassMark({.kind = begin ? PassKind::Rescale : PassKind::Other});
+            pass_framebuffer = nullptr;
+        }
+    }
     void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
     void TraceComputePipeline(u64 hash);
     /// Worker thread, inside a recorded command: timestamps one draw or dispatch of a sampled
@@ -606,6 +640,56 @@ private:
     };
     mutable std::mutex gpu_busy_mutex;
     std::optional<GpuBusySample> gpu_busy;
+
+    // MarkGpu: 8 frames of 3 timestamps, read 4 presents later (worker thread only).
+    static constexpr u32 SplitFrames = 8;
+    vk::QueryPool split_query_pool;
+    u64 split_frame{};
+    std::array<u64, SplitFrames> split_slot_frame{};
+    std::array<u8, SplitFrames> split_slot_marks{};
+    void ReadGpuSplit(u64 frame);
+    std::mutex split_mutex;
+    GpuSplit split_totals;
+
+    // Per-pass timing (recording thread only; the query results are read there too).
+    /// Submit: from the end of one command buffer to the start of the next (the GPU idle, waiting
+    /// for work, plus the next submission's staging uploads).
+    enum class PassKind : u8 { Pass, Compute, Upscaler, Rescale, Submit, Other };
+    struct PassSegment {
+        PassLabel label{};
+        u64 shader{};
+        u32 work{}; ///< draws, or dispatches
+        PassKind kind{PassKind::Other};
+        /// Other: the call that asked for work outside a render pass (a copy, blit or clear).
+        const char* file{};
+        u32 line{};
+    };
+    static constexpr u32 PassMaxMarks = 4096;
+    vk::QueryPool pass_query_pool;
+    std::vector<PassSegment> pass_segments;
+    u32 pass_count{};
+    bool pass_sampling{};
+    bool pass_pending{};
+    u32 pass_wait_presents{};
+    u64 pass_samples{};
+    const Framebuffer* pass_framebuffer{};
+    std::chrono::steady_clock::time_point pass_last_sample{};
+    void PassMark(const PassSegment& segment);
+    void PassNoteDraw(const Framebuffer* framebuffer);
+    void PassNoteDispatch(u64 hash);
+    void PassPresent();
+    void ReadPassSample();
+
+    /// Under submit_mutex: how long a submission waited for it (Present holds it across
+    /// vkQueuePresentKHR, so a blocked present delays the next submission). Logged every 10 s.
+    void NoteSubmitLockWait(std::chrono::steady_clock::duration waited);
+    struct SubmitLockStats {
+        std::chrono::steady_clock::time_point window{};
+        u64 submits{};
+        u64 waited{};
+        double wait_ms{};
+        double max_ms{};
+    } submit_lock_stats;
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 

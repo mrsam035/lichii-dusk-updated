@@ -993,8 +993,8 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
                 !worker->TryUnswizzle(
                     dst.first(host_bytes_per_layer), src.first(level_sizes[level]), 1U << bpp_log2,
                     num_tiles.width, num_tiles.height, num_tiles.depth, block.height, block.depth,
-                    stride_alignment, info.native_tiling, Nx2Perf::Verify())) {
-                UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height,
+                    stride_alignment, info.native_tiling,
+          Nx2Perf::Verify() || Nx2Perf::Slow(Nx2Perf::Site::Unswizzle))) {                UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height,
                                  num_tiles.depth, block.height, block.depth, stride_alignment,
                                  info.native_tiling);
             }

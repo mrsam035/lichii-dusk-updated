@@ -13,6 +13,8 @@
 #include <vector>
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/nvdrv/core/container.h"
@@ -28,6 +30,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_perf.h"
 
 namespace Service::Nvidia::Devices {
 namespace {
@@ -558,12 +561,29 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
     }
     flags.raw = 0;
 
-    static const bool sync_submit = [] {
+    // EDEN_NX2_SYNC_SUBMIT: unset = on for The Duskbloods only (its per-frame ring buffer is
+    // rewritten before the host has read it otherwise: red line artifacts), =1 every title, =0 off.
+    static const int sync_submit_env = [] {
         const char* value = std::getenv("EDEN_NX2_SYNC_SUBMIT");
-        return value != nullptr && value[0] != '0';
+        return value == nullptr ? -1 : value[0] != '0' ? 1 : 0;
     }();
+    const bool sync_submit_switch =
+        sync_submit_env == 1 ||
+        (sync_submit_env == -1 && Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL);
+    // The debug server's perf_flip sync_submit overrides it per submit (each waits alone).
+    const bool sync_submit =
+        VideoCommon::Nx2Perf::LiveOr(VideoCommon::Nx2Perf::g_sync_submit, sync_submit_switch);
     if (g_nx2_driver && sync_submit && increment > 0) {
         lock.unlock();
+        const auto wait_begin = std::chrono::steady_clock::now();
+        SCOPE_EXIT {
+            VideoCommon::Nx2Perf::g_sync_submit_wait_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - wait_begin)
+                                     .count()),
+                std::memory_order_relaxed);
+            VideoCommon::Nx2Perf::g_sync_submit_waits.fetch_add(1, std::memory_order_relaxed);
+        };
         auto& syncpoints = system.Host1x().GetSyncpointManager();
         if (!syncpoints.IsReadyGuest(params.fence.id, params.fence.value)) {
             struct Wake {

@@ -6,16 +6,22 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 
+#include <fmt/format.h>
+
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/dlss_evaluation.h"
 #include "video_core/dlss_mode.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
@@ -46,6 +52,54 @@ bool Evaluated(sl::Result result) {
 int EnvInt(const char* name, int fallback) {
     const char* const value = std::getenv(name);
     return value ? std::atoi(value) : fallback;
+}
+
+using Clock = std::chrono::steady_clock;
+
+u64 Nanoseconds(Clock::duration duration) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+}
+
+/// "DLSS stats:" counters. The GPU thread adds its submit time and the rare events; the
+/// scheduler's worker adds its evaluate time and writes the line about once a second.
+struct Stats {
+    std::atomic<u64> submits{};
+    std::atomic<u64> submit_ns{};
+    std::atomic<u64> submit_max_ns{};
+    std::atomic<u64> resets{};
+    std::atomic<u64> reselects{};
+    std::atomic<u64> rebuilds{};
+    std::atomic<u64> finishes{};
+    std::atomic<bool> fell_back{};
+    // The worker's
+    u64 frames{};
+    u64 eval_ns{};
+    u64 eval_max_ns{};
+    Clock::time_point since{};
+};
+Stats stats;
+std::mutex fallback_mutex;
+std::string fallback_reason;
+
+void PublishStats(std::string line) {
+    std::scoped_lock lock{VideoCommon::Nx2Perf::g_dlss_stats_mutex};
+    VideoCommon::Nx2Perf::g_dlss_stats = std::move(line);
+}
+
+std::string EventCounts() {
+    return fmt::format("resets={} reselects={} rebuilds={} finishes={} sl_problems={}",
+                       stats.resets.load(std::memory_order_relaxed),
+                       stats.reselects.load(std::memory_order_relaxed),
+                       stats.rebuilds.load(std::memory_order_relaxed),
+                       stats.finishes.load(std::memory_order_relaxed),
+                       Streamline::LoggedProblems());
+}
+
+std::string PresetName(sl::DLSSPreset preset) {
+    if (preset == sl::DLSSPreset::eDefault) {
+        return "default";
+    }
+    return std::string(1, static_cast<char>('A' + static_cast<int>(preset) - 1));
 }
 
 sl::DLSSMode ModeFor(Settings::NvidiaDlssQuality mode) {
@@ -415,8 +469,10 @@ StreamlineDlssUpscaler::~StreamlineDlssUpscaler() {
 
 void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
     if (output_image) {
+        stats.finishes.fetch_add(1, std::memory_order_relaxed);
         scheduler.Finish(); // the old output may still be in use
     }
+    stats.rebuilds.fetch_add(1, std::memory_order_relaxed);
     output_image = memory_allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
@@ -475,41 +531,128 @@ void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
     });
 }
 
+void StreamlineDlssUpscaler::CreateTightInputs(const Inputs& in) {
+    if (tight[0].image) {
+        stats.finishes.fetch_add(1, std::memory_order_relaxed);
+        scheduler.Finish(); // the old copies may still be in use
+    }
+    const std::array<const Image*, 3> sources{&in.color, &in.depth, &in.motion_vectors};
+    for (size_t i = 0; i < tight.size(); ++i) {
+        const Image& source = *sources[i];
+        tight[i].format = source.format;
+        tight[i].image = memory_allocator.CreateImage(VkImageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = source.format,
+            .extent = {in.render_size.width, in.render_size.height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        });
+        tight[i].view = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = *tight[i].image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = source.format,
+            .components{},
+            .subresourceRange{
+                .aspectMask = source.range.aspectMask,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        });
+    }
+    tight_extent = in.render_size;
+}
+
 bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     if (failed) {
         return false;
     }
-    const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
-                                in.render_size.height != render_extent.height ||
-                                in.upscale_size.width != upscale_extent.width ||
+    const Clock::time_point submit_begin = Clock::now();
+    SCOPE_EXIT {
+        const u64 ns = Nanoseconds(Clock::now() - submit_begin);
+        stats.submits.fetch_add(1, std::memory_order_relaxed);
+        stats.submit_ns.fetch_add(ns, std::memory_order_relaxed);
+        if (ns > stats.submit_max_ns.load(std::memory_order_relaxed)) {
+            stats.submit_max_ns.store(ns, std::memory_order_relaxed);
+        }
+    };
+    // Only the output size rebuilds the output. A new render size (dynamic resolution) keeps the
+    // history; the worker picks another mode only when it leaves the mode's range.
+    const bool extent_changed = !output_image || in.upscale_size.width != upscale_extent.width ||
                                 in.upscale_size.height != upscale_extent.height;
+    namespace Perf = VideoCommon::Nx2Perf;
     const auto settings = Settings::GetNvidiaDlssRuntimeSettings();
+    // perf_flip dlss_preset overrides the setting live (a test control).
+    const int live_preset = Perf::g_dlss_preset.load(std::memory_order_relaxed);
+    const Settings::NvidiaDlssPreset chosen_preset =
+        live_preset >= 0 ? static_cast<Settings::NvidiaDlssPreset>(live_preset) : settings.preset;
+    const u64 program_id = Settings::GetCurrentProgramID();
+    const Settings::NvidiaDlssPreset effective_preset =
+        VideoCommon::DlssMode::EffectivePreset(program_id, chosen_preset);
+    const Settings::NvidiaDlssQuality requested_quality =
+        VideoCommon::DlssMode::EffectiveQuality(program_id, settings.quality);
+    static const bool hdr_switch = EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0;
+    static const bool auto_exposure_switch = EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0;
+    const bool hdr_now = in.hdr && Perf::LiveOr(Perf::g_dlss_hdr, hdr_switch);
+    const bool auto_exposure_now =
+        in.hdr && Perf::LiveOr(Perf::g_dlss_auto_exposure, auto_exposure_switch);
+    // Inputs that are a region of larger images go to DLSS as render-sized copies at 0,0 (a test
+    // control, off by default: they did not stop M's lines at 4K output, 7 of 32 frames).
+    const bool tight_now = Perf::LiveOr(Perf::g_dlss_tight, false);
     const bool options_changed = extent_changed || in.hdr != hdr_input ||
-                                 quality_mode != settings.quality ||
-                                 model_preset != settings.preset;
+                                 quality_mode != requested_quality ||
+                                 model_preset != effective_preset || hdr_now != hdr_option ||
+                                 auto_exposure_now != auto_exposure_option ||
+                                 tight_now != tight_inputs;
     const bool reset = in.reset || options_changed;
+    if (reset) {
+        stats.resets.fetch_add(1, std::memory_order_relaxed);
+    }
     if (options_changed && !extent_changed) {
+        stats.finishes.fetch_add(1, std::memory_order_relaxed);
         scheduler.Finish();
     }
     if (extent_changed) {
         CreateOutput(in.upscale_size);
-        render_extent = in.render_size;
         upscale_extent = in.upscale_size;
     }
     hdr_input = in.hdr;
-    quality_mode = settings.quality;
-    model_preset = settings.preset;
+    quality_mode = requested_quality;
+    model_preset = effective_preset;
+    hdr_option = hdr_now;
+    auto_exposure_option = auto_exposure_now;
+    tight_inputs = tight_now;
+    if (tight_now && (!tight[0].image || tight_extent.width != in.render_size.width ||
+                      tight_extent.height != in.render_size.height ||
+                      tight[0].format != in.color.format || tight[1].format != in.depth.format ||
+                      tight[2].format != in.motion_vectors.format)) {
+        CreateTightInputs(in);
+    }
+    const std::array<VkImage, 3> tight_images{*tight[0].image, *tight[1].image, *tight[2].image};
+    const std::array<VkImageView, 3> tight_views{*tight[0].view, *tight[1].view, *tight[2].view};
 
     // Keep the existing HDR controls for linear input such as Fortune's Weave. Tonemapped
     // input such as Ocarina's already has its exposure applied.
     sl::DLSSOptions options{};
     options.outputWidth = in.upscale_size.width;
     options.outputHeight = in.upscale_size.height;
-    options.colorBuffersHDR =
-        in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0 ? sl::eTrue : sl::eFalse;
-    options.useAutoExposure =
-        in.hdr && EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0 ? sl::eTrue : sl::eFalse;
-    const sl::DLSSPreset preset = PresetFor(settings.preset);
+    options.colorBuffersHDR = hdr_now ? sl::eTrue : sl::eFalse;
+    options.useAutoExposure = auto_exposure_now ? sl::eTrue : sl::eFalse;
+    const sl::DLSSPreset preset = PresetFor(effective_preset);
     options.dlaaPreset = preset;
     options.qualityPreset = preset;
     options.balancedPreset = preset;
@@ -560,10 +703,12 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, in, options, options_changed, requested = settings.quality,
-                      preset_setting = settings.preset, index, constants, set_constants,
+    scheduler.Record([this, in, options, options_changed, requested = requested_quality,
+                      preset_setting = settings.preset, effective_preset, index, constants,
+                      set_constants, tight_now, tight_images, tight_views,
                       frame_gen, frame_gen_inputs, output_image_handle = *output_image,
                       output_view_handle = *output_view](vk::CommandBuffer cmdbuf) {
+        const Clock::time_point eval_begin = Clock::now();
         const Streamline::Api& api = Streamline::GetApi();
         const sl::ViewportHandle viewport{0u};
         // The caller draws the output this frame even when DLSS writes nothing to it: clear it
@@ -616,17 +761,21 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
         };
 
-        sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
-                                      VK_IMAGE_USAGE_SAMPLED_BIT);
-        sl::Resource depth = Resource(in.depth.image, in.depth.view, in.depth.format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                      in.depth_size.width != 0 ? in.depth_size : in.render_size,
-                                      VK_IMAGE_USAGE_SAMPLED_BIT);
-        sl::Resource motion = Resource(in.motion_vectors.image, in.motion_vectors.view,
-                                       in.motion_vectors.format,
-                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
-                                       VK_IMAGE_USAGE_SAMPLED_BIT);
+        // Each resource has its image's real size; render_area is the region DLSS reads.
+        const auto size_or_render = [&](VkExtent2D size) {
+            return size.width != 0 ? size : in.render_size;
+        };
+        const auto input = [&](size_t index, const Image& image, VkExtent2D size) {
+            return tight_now ? Resource(tight_images[index], tight_views[index], image.format,
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
+                                        VK_IMAGE_USAGE_SAMPLED_BIT)
+                             : Resource(image.image, image.view, image.format,
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                        size_or_render(size), VK_IMAGE_USAGE_SAMPLED_BIT);
+        };
+        sl::Resource color = input(0, in.color, in.color_size);
+        sl::Resource depth = input(1, in.depth, in.depth_size);
+        sl::Resource motion = input(2, in.motion_vectors, in.motion_size);
         sl::Resource output = Resource(output_image_handle, output_view_handle, OUTPUT_FORMAT,
                                        VK_IMAGE_LAYOUT_GENERAL, in.upscale_size, OUTPUT_USAGE);
         const sl::Extent render_area{0, 0, in.render_size.width, in.render_size.height};
@@ -661,10 +810,14 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         const auto lock = Streamline::LockStreamline();
         const auto result = VideoCommon::RecordDlssEvaluation(
             [&] {
-                if (!options_changed) {
+                namespace Mode = VideoCommon::DlssMode;
+                if (!options_changed &&
+                    Mode::Fits({in.render_size.width, in.render_size.height},
+                               {in.upscale_size.width, in.upscale_size.height}, evaluated_mode,
+                               mode_range)) {
                     return true;
                 }
-                namespace Mode = VideoCommon::DlssMode;
+                stats.reselects.fetch_add(1, std::memory_order_relaxed);
                 auto validated = options;
                 const auto selection = Mode::Select(
                     requested, {in.render_size.width, in.render_size.height},
@@ -701,6 +854,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 }
                 validated.mode = ModeFor(*selection.mode);
                 evaluated_mode = *selection.mode;
+                mode_range = selection.range;
                 LOG_INFO(Render_Vulkan,
                          "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}, {}",
                          in.render_size.width, in.render_size.height, in.upscale_size.width,
@@ -716,8 +870,59 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 return api_result == sl::Result::eOk && frame;
             },
             [&] {
+                if (!tight_now) {
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {},
+                                           to_read);
+                    return;
+                }
+                // Copy the render region into the tight images; the inputs stay in GENERAL.
+                const std::array<const Image*, 3> sources{&in.color, &in.depth,
+                                                          &in.motion_vectors};
+                std::array<VkImageMemoryBarrier, 6> before{};
+                std::array<VkImageMemoryBarrier, 3> after{};
+                for (size_t i = 0; i < sources.size(); ++i) {
+                    const Image& source = *sources[i];
+                    before[i] = Barrier(source, WRITES, VK_ACCESS_TRANSFER_READ_BIT,
+                                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+                    Image copy = source;
+                    copy.image = tight_images[i];
+                    copy.range.baseMipLevel = 0;
+                    copy.range.baseArrayLayer = 0;
+                    before[3 + i] = Barrier(copy, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                            VK_IMAGE_LAYOUT_UNDEFINED,
+                                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    after[i] = Barrier(copy, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_ACCESS_SHADER_READ_BIT,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                }
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, to_read);
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {}, before);
+                for (size_t i = 0; i < sources.size(); ++i) {
+                    const Image& source = *sources[i];
+                    const VkImageCopy region{
+                        .srcSubresource{
+                            .aspectMask = source.range.aspectMask,
+                            .mipLevel = source.range.baseMipLevel,
+                            .baseArrayLayer = source.range.baseArrayLayer,
+                            .layerCount = 1,
+                        },
+                        .srcOffset = {0, 0, 0},
+                        .dstSubresource{
+                            .aspectMask = source.range.aspectMask,
+                            .mipLevel = 0,
+                            .baseArrayLayer = 0,
+                            .layerCount = 1,
+                        },
+                        .dstOffset = {0, 0, 0},
+                        .extent = {in.render_size.width, in.render_size.height, 1},
+                    };
+                    cmdbuf.CopyImage(source.image, VK_IMAGE_LAYOUT_GENERAL, tight_images[i],
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+                }
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, after);
             },
             [&] {
                 if (!set_constants) {
@@ -743,6 +948,12 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 return true;
             },
             [&] {
+                if (tight_now) {
+                    // The inputs never left GENERAL; the copies are rewritten next frame.
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, output_written);
+                    return;
+                }
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, output_written, {},
                                        to_general);
@@ -753,12 +964,17 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                       static_cast<int>(result), static_cast<int>(api_result));
         }
         if (result != VideoCommon::DlssEvaluationResult::Succeeded) {
+            static constexpr std::array<std::string_view, 5> STAGES{
+                "succeeded", "options", "frame_token", "constants", "evaluate"};
+            NoteFallback(fmt::format("{} failed, Streamline result {}",
+                                     STAGES[static_cast<size_t>(result)],
+                                     static_cast<int>(api_result)));
             clear_output();
             return;
         }
         last_evaluation.store(static_cast<u32>(evaluated_mode) |
                                   (static_cast<u32>(requested) << 8) |
-                                  (static_cast<u32>(preset_setting) << 16),
+                                  (static_cast<u32>(effective_preset) << 16),
                               std::memory_order_relaxed);
         evaluations.fetch_add(1, std::memory_order_release);
         // NGX doesn't report the model it picked, but its memory tells them apart: at 3840x2160
@@ -770,20 +986,72 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                      static_cast<int>(options.dlaaPreset),
                      static_cast<double>(state.estimatedVRAMUsageInBytes) / 1e6);
         }
+
+        const Clock::time_point now = Clock::now();
+        const u64 eval_ns = Nanoseconds(now - eval_begin);
+        if (stats.since == Clock::time_point{}) {
+            stats.since = eval_begin;
+        }
+        ++stats.frames;
+        stats.eval_ns += eval_ns;
+        stats.eval_max_ns = (std::max)(stats.eval_max_ns, eval_ns);
+        if (now - stats.since < std::chrono::seconds{1}) {
+            return;
+        }
+        const u64 submits = stats.submits.exchange(0, std::memory_order_relaxed);
+        const u64 submit_ns = stats.submit_ns.exchange(0, std::memory_order_relaxed);
+        const u64 submit_max_ns = stats.submit_max_ns.exchange(0, std::memory_order_relaxed);
+        std::string line = fmt::format(
+            "DLSS stats: frames={} secs={:.2f} total={} submit_us={}/{} eval_us={}/{} "
+            "render={}x{} output={}x{} mode={} preset={} preset_setting={} hdr={} "
+            "auto_exposure={} tight={} {} fallback=none",
+            stats.frames, std::chrono::duration<double>(now - stats.since).count(),
+            evaluations.load(std::memory_order_relaxed),
+            submits ? submit_ns / submits / 1000 : 0, submit_max_ns / 1000,
+            stats.eval_ns / stats.frames / 1000, stats.eval_max_ns / 1000, in.render_size.width,
+            in.render_size.height, in.upscale_size.width, in.upscale_size.height,
+            Settings::CanonicalizeEnum(evaluated_mode), PresetName(options.dlaaPreset),
+            Settings::CanonicalizeEnum(preset_setting),
+            options.colorBuffersHDR == sl::eTrue ? 1 : 0,
+            options.useAutoExposure == sl::eTrue ? 1 : 0, tight_now ? 1 : 0, EventCounts());
+        LOG_INFO(Render_Vulkan, "{}", line);
+        PublishStats(std::move(line));
+        stats.frames = 0;
+        stats.eval_ns = 0;
+        stats.eval_max_ns = 0;
+        stats.since = now;
     });
     // DLSS binds its own pipelines and descriptors on the command buffer.
     scheduler.InvalidateState();
     return true;
 }
 
+void StreamlineDlssUpscaler::NoteFallback(std::string_view reason) {
+    if (stats.fell_back.exchange(true)) {
+        return;
+    }
+    {
+        std::scoped_lock lock{fallback_mutex};
+        fallback_reason = reason;
+    }
+    std::string line = fmt::format("DLSS stats: total={} {} fallback={}",
+                                   evaluations.load(std::memory_order_relaxed), EventCounts(),
+                                   reason);
+    LOG_WARNING(Render_Vulkan, "{}", line);
+    PublishStats(std::move(line));
+}
+
 VideoCore::DlssStatus StreamlineDlssUpscaler::Status() {
     const u64 count = evaluations.load(std::memory_order_acquire);
     const u32 last = last_evaluation.load(std::memory_order_relaxed);
+    std::scoped_lock lock{fallback_mutex};
     return {
         .evaluations = count,
         .mode = static_cast<Settings::NvidiaDlssQuality>(last & 0xff),
         .requested = static_cast<Settings::NvidiaDlssQuality>((last >> 8) & 0xff),
         .preset = static_cast<Settings::NvidiaDlssPreset>((last >> 16) & 0xff),
+        .streamline = Streamline::IsDlssAvailable(),
+        .fallback = fallback_reason,
     };
 }
 

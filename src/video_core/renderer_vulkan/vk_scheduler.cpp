@@ -24,7 +24,10 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/dlss_mode.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/texture_cache/formatter.h"
 #include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -133,6 +136,23 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
                 .pipelineStatistics = 0,
             });
             trace_submissions.resize(TraceMaxSubmissions);
+            split_query_pool = device.GetLogical().CreateQueryPool({
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = SplitFrames * 3,
+                .pipelineStatistics = 0,
+            });
+            pass_query_pool = device.GetLogical().CreateQueryPool({
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = PassMaxMarks,
+                .pipelineStatistics = 0,
+            });
+            pass_segments.resize(PassMaxMarks);
             if (Common::DkbFrameTrace::Enabled()) {
                 trace_work_pool = device.GetLogical().CreateQueryPool({
                     .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
@@ -335,6 +355,328 @@ std::optional<double> Scheduler::GpuBusyMs() const {
     return gpu_busy->ms;
 }
 
+void Scheduler::MarkGpu(GpuMark mark) {
+    if (!split_query_pool) {
+        return;
+    }
+    if (mark == GpuMark::Present) {
+        PassPresent();
+    } else if (pass_sampling) {
+        PassMark({.kind = mark == GpuMark::UpscaleBegin ? PassKind::Upscaler : PassKind::Other});
+        pass_framebuffer = nullptr;
+    }
+    RecordWithUploadBuffer([this, mark](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+        const u32 slot = static_cast<u32>(split_frame % SplitFrames);
+        if (split_slot_frame[slot] != split_frame) {
+            split_slot_frame[slot] = split_frame;
+            split_slot_marks[slot] = 0;
+        }
+        const u32 index = static_cast<u32>(mark);
+        const u32 query = slot * 3 + index;
+        // The upload buffer runs first in the same submission; queries can't be reset in a pass.
+        upload_cmdbuf.ResetQueryPool(*split_query_pool, query, 1);
+        cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *split_query_pool, query);
+        split_slot_marks[slot] |= static_cast<u8>(1u << index);
+        if (mark == GpuMark::Present) {
+            if (split_frame >= 4) {
+                ReadGpuSplit(split_frame - 4);
+            }
+            ++split_frame;
+        }
+    });
+}
+
+void Scheduler::ReadGpuSplit(u64 frame) {
+    const u32 slot = static_cast<u32>(frame % SplitFrames);
+    const u32 previous = static_cast<u32>((frame + SplitFrames - 1) % SplitFrames);
+    if (frame == 0 || split_slot_frame[slot] != frame || split_slot_marks[slot] != 7 ||
+        split_slot_frame[previous] != frame - 1 || (split_slot_marks[previous] & 4) == 0) {
+        return;
+    }
+    struct Result {
+        u64 timestamp;
+        u64 available;
+    };
+    std::array<Result, 3> results{};
+    Result previous_present{};
+    const auto flags = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
+    if (device.GetLogical().GetQueryResults(*split_query_pool, slot * 3, 3, sizeof(results),
+                                            results.data(), sizeof(Result), flags) != VK_SUCCESS ||
+        device.GetLogical().GetQueryResults(*split_query_pool, previous * 3 + 2, 1,
+                                            sizeof(previous_present), &previous_present,
+                                            sizeof(Result), flags) != VK_SUCCESS) {
+        return;
+    }
+    if (!results[0].available || !results[1].available || !results[2].available ||
+        !previous_present.available) {
+        return;
+    }
+    const auto ms = [this](u64 begin, u64 end) {
+        return static_cast<double>(
+                   Common::DkbFrameTrace::TimestampDelta(begin, end, trace_timestamp_bits)) *
+               trace_timestamp_period / 1e6;
+    };
+    const double upscale = ms(results[0].timestamp, results[1].timestamp);
+    std::scoped_lock lock{split_mutex};
+    ++split_totals.frames;
+    split_totals.pre_ms += ms(previous_present.timestamp, results[0].timestamp);
+    split_totals.upscale_ms += upscale;
+    split_totals.post_ms += ms(results[1].timestamp, results[2].timestamp);
+    split_totals.upscale_max_ms = std::max(split_totals.upscale_max_ms, upscale);
+}
+
+Scheduler::GpuSplit Scheduler::TakeGpuSplit() {
+    std::scoped_lock lock{split_mutex};
+    GpuSplit result = std::exchange(split_totals, GpuSplit{});
+    if (result.frames != 0) {
+        const double frames = static_cast<double>(result.frames);
+        result.pre_ms /= frames;
+        result.upscale_ms /= frames;
+        result.post_ms /= frames;
+    }
+    return result;
+}
+
+void Scheduler::PassMark(const PassSegment& segment) {
+    // The last query is kept for the present that closes the frame.
+    if (pass_count + 1 >= PassMaxMarks) {
+        return;
+    }
+    const u32 query = pass_count++;
+    pass_segments[query] = segment;
+    Record([this, query](vk::CommandBuffer cmdbuf) {
+        cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pass_query_pool, query);
+    });
+}
+
+void Scheduler::PassNoteDraw(const Framebuffer* framebuffer) {
+    if (framebuffer == pass_framebuffer && pass_count != 0 &&
+        pass_segments[pass_count - 1].kind == PassKind::Pass) {
+        ++pass_segments[pass_count - 1].work;
+        return;
+    }
+    PassMark({.label = framebuffer->Label(), .work = 1, .kind = PassKind::Pass});
+    pass_framebuffer = framebuffer;
+}
+
+void Scheduler::PassNoteDispatch(u64 hash) {
+    pass_framebuffer = nullptr;
+    if (pass_count != 0 && pass_segments[pass_count - 1].kind == PassKind::Compute &&
+        pass_segments[pass_count - 1].shader == hash) {
+        ++pass_segments[pass_count - 1].work;
+        return;
+    }
+    PassMark({.shader = hash, .work = 1, .kind = PassKind::Compute});
+}
+
+void Scheduler::PassPresent() {
+    if (!pass_query_pool) {
+        return;
+    }
+    if (pass_sampling) {
+        // Closes the sampled frame (PassMark keeps this query free).
+        const u32 query = pass_count++;
+        pass_segments[query] = {};
+        Record([this, query](vk::CommandBuffer cmdbuf) {
+            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pass_query_pool, query);
+        });
+        pass_sampling = false;
+        pass_pending = true;
+        pass_wait_presents = 0;
+        pass_framebuffer = nullptr;
+        return;
+    }
+    if (pass_pending) {
+        // A few presents later the GPU has run the frame; give up on it after 60.
+        if (++pass_wait_presents >= 3) {
+            ReadPassSample();
+        }
+        return;
+    }
+    if (!VideoCommon::Nx2Perf::LiveOr(VideoCommon::Nx2Perf::g_pass_timing,
+                                      Settings::GetCurrentProgramID() ==
+                                          VideoCommon::DlssMode::DuskbloodsProgramId)) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - pass_last_sample < std::chrono::seconds{2}) {
+        return;
+    }
+    pass_last_sample = now;
+    pass_sampling = true;
+    pass_count = 0;
+    pass_framebuffer = nullptr;
+    // The upload buffer runs first in its submission; queries can't be reset in a pass.
+    RecordWithUploadBuffer([this](vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+        upload_cmdbuf.ResetQueryPool(*pass_query_pool, 0, PassMaxMarks);
+    });
+    PassMark({.kind = PassKind::Other});
+}
+
+void Scheduler::NoteSubmitLockWait(std::chrono::steady_clock::duration waited) {
+    SubmitLockStats& stats = submit_lock_stats;
+    const auto now = std::chrono::steady_clock::now();
+    if (stats.window == std::chrono::steady_clock::time_point{}) {
+        stats.window = now;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(waited).count();
+    ++stats.submits;
+    if (ms >= 0.05) {
+        ++stats.waited;
+        stats.wait_ms += ms;
+        stats.max_ms = (std::max)(stats.max_ms, ms);
+    }
+    if (now - stats.window >= std::chrono::seconds{10}) {
+        LOG_INFO(Render_Vulkan,
+                 "Submit lock in 10 s: {} submits, {} waited {:.1f} ms in all (longest {:.2f} ms)",
+                 stats.submits, stats.waited, stats.wait_ms, stats.max_ms);
+        stats = SubmitLockStats{.window = now};
+    }
+}
+
+void Scheduler::ReadPassSample() {
+    struct Result {
+        u64 timestamp;
+        u64 available;
+    };
+    const u32 count = pass_count;
+    std::vector<Result> results(count);
+    const auto flags = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
+    const VkResult read = device.GetLogical().GetQueryResults(
+        *pass_query_pool, 0, count, results.size() * sizeof(Result), results.data(),
+        sizeof(Result), flags);
+    const bool ready =
+        count >= 2 && (read == VK_SUCCESS || read == VK_NOT_READY) &&
+        std::ranges::all_of(results, [](const Result& result) { return result.available != 0; });
+    if (!ready) {
+        if (pass_wait_presents >= 60) {
+            pass_pending = false;
+        }
+        return;
+    }
+    pass_pending = false;
+    ++pass_samples;
+    const auto ms = [this](u64 begin, u64 end) {
+        return static_cast<double>(
+                   Common::DkbFrameTrace::TimestampDelta(begin, end, trace_timestamp_bits)) *
+               trace_timestamp_period / 1e6;
+    };
+    // Segments with the same targets (or shader) add up: a pass split by copies or one the game
+    // binds again later in the frame counts once.
+    struct Group {
+        PassSegment segment;
+        double ms{};
+        u32 work{};
+        u32 runs{};
+    };
+    std::vector<Group> groups;
+    u32 draws{};
+    u32 dispatches{};
+    const auto same = [](const PassSegment& a, const PassSegment& b) {
+        if (a.kind != b.kind) {
+            return false;
+        }
+        switch (a.kind) {
+        case PassKind::Pass:
+            return a.label.color_addr == b.label.color_addr &&
+                   a.label.depth_addr == b.label.depth_addr && a.label.width == b.label.width &&
+                   a.label.height == b.label.height && a.label.scaled == b.label.scaled;
+        case PassKind::Compute:
+            return a.shader == b.shader;
+        case PassKind::Other:
+            return a.line == b.line && std::string_view{a.file ? a.file : ""} ==
+                                           std::string_view{b.file ? b.file : ""};
+        default:
+            return true;
+        }
+    };
+    for (u32 i = 0; i + 1 < count; ++i) {
+        const PassSegment& segment = pass_segments[i];
+        if (segment.kind == PassKind::Pass) {
+            draws += segment.work;
+        } else if (segment.kind == PassKind::Compute) {
+            dispatches += segment.work;
+        }
+        auto it = std::ranges::find_if(groups, [&](const Group& g) { return same(g.segment, segment); });
+        if (it == groups.end()) {
+            it = groups.insert(groups.end(), Group{segment});
+        }
+        it->ms += ms(results[i].timestamp, results[i + 1].timestamp);
+        it->work += segment.work;
+        ++it->runs;
+    }
+    const double total = ms(results[0].timestamp, results[count - 1].timestamp);
+    // The GPU's busy share of the frame: the rest is idle between submissions (or uploads).
+    double idle{};
+    u32 submits{};
+    for (const Group& group : groups) {
+        if (group.segment.kind == PassKind::Submit) {
+            idle += group.ms;
+            submits += group.runs;
+        }
+    }
+    const double busy = total > 0 ? 100.0 * (total - idle) / total : 0.0;
+    std::ranges::sort(groups, [](const Group& a, const Group& b) { return a.ms > b.ms; });
+    std::string top;
+    for (size_t i = 0; i < groups.size() && i < 14; ++i) {
+        const Group& group = groups[i];
+        const PassSegment& s = group.segment;
+        const double share = total > 0 ? group.ms * 100.0 / total : 0.0;
+        std::string what;
+        switch (s.kind) {
+        case PassKind::Pass:
+            what = fmt::format(
+                "pass {} {}x{} {}", s.label.color_addr ? fmt::format("{:x}", s.label.color_addr)
+                                                       : std::string{"-"},
+                s.label.width, s.label.height,
+                s.label.color_addr
+                    ? fmt::format("{}", static_cast<VideoCore::Surface::PixelFormat>(
+                                            s.label.color_format))
+                    : std::string{"no colour"});
+            if (s.label.colors > 1) {
+                what += fmt::format(" +{} targets", s.label.colors - 1);
+            }
+            if (s.label.depth_addr) {
+                what += fmt::format(" depth {:x} {}", s.label.depth_addr,
+                                    static_cast<VideoCore::Surface::PixelFormat>(
+                                        s.label.depth_format));
+            }
+            what += fmt::format(" {} draws {} in {}", s.label.scaled ? "scaled" : "1x", group.work,
+                                group.runs);
+            break;
+        case PassKind::Compute:
+            what = fmt::format("compute {:016x} dispatches {} in {}", s.shader, group.work,
+                               group.runs);
+            break;
+        case PassKind::Upscaler:
+            what = "upscaler";
+            break;
+        case PassKind::Rescale:
+            what = fmt::format("rescale copies {}", group.runs);
+            break;
+        case PassKind::Submit:
+            what = fmt::format("between submits (GPU idle + uploads) {}", group.runs);
+            break;
+        case PassKind::Other: {
+            std::string_view site{s.file ? s.file : "other"};
+            if (const size_t slash = site.find_last_of("/\\"); slash != std::string_view::npos) {
+                site.remove_prefix(slash + 1);
+            }
+            what = s.line != 0 ? fmt::format("copies/clears/blits {}:{} in {}", site, s.line,
+                                             group.runs)
+                               : fmt::format("copies/clears/blits in {}", group.runs);
+            break;
+        }
+        }
+        top += fmt::format("{}[{:.2f} ms {:.0f}% {}]", top.empty() ? "" : " ", group.ms, share,
+                           what);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Nx2Pass GPU sample {}: {:.2f} ms present to present, GPU busy {:.0f}% ({:.2f} ms "
+             "idle over {} submits), {} segments, {} draws, {} dispatches; top: {}",
+             pass_samples, total, busy, idle, submits, count - 1, draws, dispatches, top);
+}
+
 void Scheduler::DispatchWork() {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
@@ -511,6 +853,9 @@ void Scheduler::FlushDeferredClear() {
 }
 
 void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_location location) {
+    if (pass_sampling) [[unlikely]] {
+        PassNoteDraw(framebuffer);
+    }
     if (deferred_clear.framebuffer == framebuffer) {
         RealizeDeferredClear();
         return;
@@ -539,6 +884,21 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
+    if (pass_sampling) [[unlikely]] {
+        // Copies, blits and clears count apart from passes, by the call that asked for them; a
+        // rescale or upscale keeps its own segment.
+        const PassSegment* const last = pass_count != 0 ? &pass_segments[pass_count - 1] : nullptr;
+        const bool inside = last && (last->kind == PassKind::Rescale ||
+                                     last->kind == PassKind::Upscaler);
+        const bool same_site = last && last->kind == PassKind::Other && last->file &&
+                               last->line == location.line() &&
+                               std::string_view{last->file} == location.file_name();
+        if (pass_framebuffer || (!inside && !same_site)) {
+            PassMark({.kind = PassKind::Other, .file = location.file_name(),
+                      .line = location.line()});
+        }
+        pass_framebuffer = nullptr;
+    }
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -715,6 +1075,7 @@ void Scheduler::TraceGraphicsPipeline(const std::array<u64, 6>& hashes) {
 }
 
 void Scheduler::TraceComputePipeline(u64 hash) {
+    PassDispatch(hash);
     if (!trace_work_pool) {
         return;
     }
@@ -1161,6 +1522,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     }
     EndPendingOperations();
     InvalidateState();
+    if (pass_sampling) [[unlikely]] {
+        PassMark({.kind = PassKind::Submit});
+        pass_framebuffer = nullptr;
+    }
 
     const u64 signal_value = master_semaphore->NextTick();
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
@@ -1198,7 +1563,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             on_submit();
         }
 
+        const auto lock_start = std::chrono::steady_clock::now();
         std::scoped_lock lock{submit_mutex};
+        NoteSubmitLockWait(std::chrono::steady_clock::now() - lock_start);
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:
@@ -1234,6 +1601,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     });
     chunk->MarkSubmit();
     DispatchWork();
+    if (pass_sampling) [[unlikely]] {
+        // The next command buffer's first timestamp closes the gap.
+        PassMark({.kind = PassKind::Other});
+    }
     return signal_value;
 }
 

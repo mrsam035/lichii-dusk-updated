@@ -15,6 +15,7 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <fmt/ranges.h>
@@ -147,7 +148,7 @@ void BufferCache<P>::TickFrame() {
         }
     }
     if (const GeometryStats& stats = geometry_stats; frame_tick % 600 == 0 && stats.syncs != 0) {
-        if (Nx2Profile::Enabled() || Nx2Perf::Verify()) {
+        if (Nx2Profile::Enabled() || Nx2Perf::Slow(Nx2Perf::Site::GeometrySync)) {
             LOG_INFO(HW_GPU,
                      "Geometry upload scans in 600 frames: {} of {} skipped, {} verify mismatches",
                      stats.syncs_skipped, stats.syncs, stats.verify_mismatches);
@@ -258,7 +259,7 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
         const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
         const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
         if (!gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
-            if (!Nx2Perf::Verify()) {
+            if (!Nx2Perf::Slow(Nx2Perf::Site::WritePages)) {
                 if (engine_write) {
                     // Untracking the pages and tracking them again at the upload changed their
                     // host protection twice (two VirtualProtect calls each, ~4% of the GPU
@@ -1705,6 +1706,20 @@ void BufferCache<P>::BindHostStageBuffers(size_t stage) {
     if (channel_state->enabled_texture_buffers[stage] != 0) {
         BindHostGraphicsTextureBuffers(stage);
     }
+    if (nx2_ssbo_diag && stage == NUM_STAGES - 1) {
+        nx2_ssbo_diag = false;
+        // Once, then whenever the shape (stages, clean/uploaded, GPU-written, SSBO 0 zero) changes.
+        if (nx2_ssbo_diag_shape != nx2_ssbo_diag_last_shape && nx2_ssbo_diag_lines < 256) {
+            ++nx2_ssbo_diag_lines;
+            nx2_ssbo_diag_last_shape = nx2_ssbo_diag_shape;
+            const Binding& vertex = channel_state->vertex_buffers[0];
+            const Binding& index = channel_state->index_buffer;
+            LOG_INFO(HW_GPU,
+                     "Duskbloods ribbon draw: vertex 0 {:#x}+{:#x}, index {:#x}+{:#x};{}",
+                     vertex.device_addr, vertex.size, index.device_addr, index.size,
+                     nx2_ssbo_diag_text);
+        }
+    }
 }
 
 template <class P>
@@ -1999,7 +2014,16 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     // binding is up to 8 MiB past it, and marking all of it defers the CPU's later writes to those
     // pages until the next fence and has fences copy the over-marked range back.
     u64 mark = binding.size;
-    if (native_pointer && is_written && binding.size != 0) {
+    // EDEN_NX2_DUSK_SSBO_MARK: unset or anything but "auto" marks the whole binding for The
+    // Duskbloods, as dusk-v2.5 (before #816). Its particle compute (d4b9d21ade153251) writes far
+    // past the proven extent, into the records its ribbon tessellation programs read; unmarked,
+    // those bytes counted as clean guest memory (zeros) and the ribbons drew long red beams.
+    static const bool dusk_full_mark = [] {
+        const char* value = std::getenv("EDEN_NX2_DUSK_SSBO_MARK");
+        return Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL &&
+               (value == nullptr || std::string_view{value} != "auto");
+    }();
+    if (native_pointer && is_written && binding.size != 0 && !dusk_full_mark) {
         switch (Settings::values.native_compute_write_mark.GetValue()) {
         case Settings::NativeComputeWriteMark::Auto: {
             const auto& qmd = launch_desc;
@@ -2662,7 +2686,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
     }();
     if (native_bank &&
-        (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
+        (Nx2Perf::Slow(Nx2Perf::Site::NativeIndirectUniforms) || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
         !memory_tracker.IsRegionGpuModified(device_addr, size) &&
         native_indirect_uniforms_this_frame.insert(device_addr).second) {
         // The bank size is only an upper limit: stop at the end of the mapped memory.
@@ -2866,12 +2890,36 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
         if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
+            if (nx2_ssbo_diag) {
+                nx2_ssbo_diag_text += fmt::format(" s{}[{}] {:#x}+{:#x} multi-range;", stage,
+                                                  index, binding.gpu_addr, binding.size);
+                nx2_ssbo_diag_shape += fmt::format("s{}[{}]m;", stage, index);
+            }
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
-        SynchronizeBuffer(buffer, binding.device_addr, size);
+        const bool clean = SynchronizeBuffer(buffer, binding.device_addr, size);
+        if (nx2_ssbo_diag) {
+            const bool gpu_written = IsRegionGpuModified(binding.device_addr, size);
+            nx2_ssbo_diag_text += fmt::format(" s{}[{}] {:#x}+{:#x} {} {}{};", stage, index,
+                                              binding.gpu_addr, size,
+                                              clean ? "clean" : "uploaded",
+                                              gpu_written ? "gpu-written" : "cpu",
+                                              is_written ? " written" : "");
+            nx2_ssbo_diag_shape += fmt::format("s{}[{}]{}{}{};", stage, index, clean ? 'c' : 'u',
+                                               gpu_written ? 'g' : 'p', size > 16_MiB ? 'L' : 'S');
+            if (index == 0) {
+                std::array<u8, 64> bytes{};
+                device_memory.ReadBlockUnsafe(binding.device_addr, bytes.data(),
+                                              (std::min<size_t>)(bytes.size(), size));
+                const bool zero = std::ranges::all_of(bytes, [](u8 byte) { return byte == 0; });
+                nx2_ssbo_diag_text += fmt::format(" ssbo0 guest[0,64)={:02x};",
+                                                  fmt::join(bytes, ""));
+                nx2_ssbo_diag_shape += zero ? "z;" : "d;";
+            }
+        }
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
@@ -3907,8 +3955,8 @@ template <class P>
 bool BufferCache<P>::UploadModifiedMemory(Buffer& buffer, DAddr device_addr, u32 size) {
     // An upload over a clean word of the tracker (word_manager.h) finds and changes nothing:
     // walk only the dirty ones. Verify walks every word and checks the clean words.
-    const bool skip_clean = !Nx2Perf::Verify();
-    if (Nx2Perf::Verify()) {
+    const bool skip_clean = !Nx2Perf::Slow(Nx2Perf::Site::CleanWords);
+    if (Nx2Perf::Slow(Nx2Perf::Site::CleanWords)) {
         static std::atomic<u32> logged{};
         if (!memory_tracker.CleanWordsHold(device_addr, size) &&
             logged.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -4001,7 +4049,7 @@ void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAd
         sync.device_addr == device_addr && sync.size == size &&
         sync.deletions == buffer_deletions) {
         ++geometry_stats.syncs_skipped;
-        if (Nx2Perf::Verify() && !SynchronizeBuffer(buffer, device_addr, size)) {
+        if (Nx2Perf::Slow(Nx2Perf::Site::GeometrySync) && !SynchronizeBuffer(buffer, device_addr, size)) {
             ++geometry_stats.verify_mismatches;
         }
         return;
@@ -4425,13 +4473,16 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U) |
         (compute ? 8U : 0U) | (sized ? 16U : 0U);
     const size_t owner = gpu_memory->GetID() + 1;
-    const u64 serial = gpu_memory->MapSerial();
+    // A live Nx2Perf change (debug server) forgets every thread's memo: the change count rides in
+    // the serial's top bits.
+    const u64 serial = gpu_memory->MapSerial() ^
+                       (Nx2Perf::g_live_applied.load(std::memory_order_relaxed) << 48);
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
     for (size_t way = 0; way < ways; ++way) {
         const CachedBinding& cached = set[way];
         if (cached.owner == owner && cached.gpu_addr == gpu_addr &&
             cached.next_qword == next_qword && cached.serial == serial &&
-            cached.alignment == alignment && cached.flags == flags && !Nx2Perf::Verify()) {
+            cached.alignment == alignment && cached.flags == flags && !Nx2Perf::Slow(Nx2Perf::Site::StorageBindingCache)) {
             const Binding hit = cached.binding;
             std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
             return hit;
@@ -4471,7 +4522,15 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                 // came back zero and lit land and characters too dark. A read-only compute binding
                 // takes a larger size word. Binding to the end of the mapping instead spanned
                 // Ocarina of Time's ~1 GiB heap and backed it with a 1 GiB buffer.
-                if (compute && !is_written && next_qword_is_size && packed_size > bare) {
+                // EDEN_NX2_DUSK_SSBO_SIZE=v25: The Duskbloods keeps dusk-v2.5's 8 MiB cap (A/B for
+                // its fog compute, which reads ~100 MiB bindings since #1231).
+                static const bool dusk_v25_size = [] {
+                    const char* value = std::getenv("EDEN_NX2_DUSK_SSBO_SIZE");
+                    return Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL &&
+                           value != nullptr && std::string_view{value} == "v25";
+                }();
+                if (compute && !is_written && next_qword_is_size && packed_size > bare &&
+                    !dusk_v25_size) {
                     return (std::min)(packed_size, limit);
                 }
                 return bare;

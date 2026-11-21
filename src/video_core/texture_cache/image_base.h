@@ -120,6 +120,10 @@ struct ImageBase {
     /// CpuModified. Empty while CpuModified means all of it that can hold data.
     std::vector<std::pair<u64, u64>> dirty_ranges;
     u64 scale_tick = 0;
+    u64 rescale_change_tick = 0; ///< frame_tick + 1 of the last ScaleUp/ScaleDown that changed it
+    u32 flip_streak = 0; ///< scale changes in a row, each within 120 frames of the one before
+    u32 native_pin = 0;  ///< TextureCache::pin_generation while pinned at 1x (rescale_pin)
+    u64 main_tick = 0;   ///< frame_tick + 1 of the last upscale that took it (TextureCache::IsMain)
     bool has_scaled = false;
 
     /// The channel and GPU address space whose page table RegisterImage put the image in.

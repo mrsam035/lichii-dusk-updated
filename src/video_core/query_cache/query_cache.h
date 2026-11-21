@@ -28,6 +28,7 @@
 #include "video_core/query_cache/query_base.h"
 #include "video_core/query_cache/query_cache_base.h"
 #include "video_core/query_cache/query_stream.h"
+#include "video_core/query_cache/report_slots.h"
 #include "video_core/query_cache/types.h"
 
 namespace VideoCommon {
@@ -286,11 +287,30 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     const u64 report_size = has_timestamp ? 16 : 4;
+    // #1099 (#337 perf regression): a fence-flagged payload release writes a constant, so at low
+    // accuracy with Default fences it stays synchronized as before #337: its fence may be skipped
+    // and the query freed at once. Only reports of GPU counters wait for their fence to run. A
+    // release over a report still pending waits too, so the older report can't land after it.
+    // On by default for The Duskbloods only; EDEN_NX2_SYNC_PAYLOAD_RELEASES=1/0 forces it.
+    static const int sync_releases_switch = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNC_PAYLOAD_RELEASES");
+        return value == nullptr || value[0] == '\0' ? -1 : (value[0] != '0' ? 1 : 0);
+    }();
+    const bool sync_releases =
+        sync_releases_switch == 1 ||
+        (sync_releases_switch == -1 && Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL);
+    const bool is_synced = sync_releases && is_fence && counter_type == QueryType::Payload &&
+                           (Settings::IsGPUFenceBehaviorDefault()
+                                ? !Settings::IsGPULevelHigh()
+                                : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                      !Settings::IsGPUFenceBehaviorAccurate()) &&
+                           !HoldsQueries(cpu_addr, report_size);
     const bool immediate =
         !is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload;
     // Written later: the buffer cache keeps GPU writes over it until then (NoteReportPending).
+    // A synchronized release is written inside SignalFence, before any later GPU work.
     const bool report_noted =
-        !immediate && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
+        !immediate && !is_synced && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
     // What the operation needs, small enough for MSVC's std::function to hold without allocating:
     // a report per draw (Ocarina of Time's occlusion counts) allocated one each. Host pointers are
     // looked up when it runs.
@@ -304,6 +324,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         bool mirrored;
         bool wide;
         bool noted;
+        bool synced;
     };
     const ReportOp report_op{
         .query = query,
@@ -315,6 +336,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         .mirrored = mirrored,
         .wide = has_timestamp,
         .noted = report_noted,
+        .synced = is_synced,
     };
     const auto operation_body = [this, op = report_op] {
         const DAddr op_cpu_addr = op.cpu_addr;
@@ -330,6 +352,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             if (op.noted) {
                 impl->rasterizer.FinishReport(op_cpu_addr, op_report_size);
             }
+            // Written or discarded: FlushQueryResults' lean wait stops waiting for it.
+            VideoCommon::ReportSlots::Complete(op_cpu_addr);
         };
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
@@ -339,7 +363,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                          trace, asid, op_addr, op_cpu_addr, static_cast<u32>(op_counter_type),
                          static_cast<u32>(query_base->flags));
             }
-            impl->pending_unregister.push_back(op_location);
+            if (!op.synced) {
+                impl->pending_unregister.push_back(op_location);
+            }
             return;
         }
         if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
@@ -352,7 +378,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             }
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
-            impl->pending_unregister.push_back(op_location);
+            if (!op.synced) {
+                impl->pending_unregister.push_back(op_location);
+            }
             return;
         }
         query_base->value += op_streamer->GetAmendValue();
@@ -391,15 +419,22 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                      wide ? 8 : 4, wide ? query_base->value : static_cast<u32>(query_base->value),
                      static_cast<u32>(query_base->flags));
         }
-        impl->pending_unregister.push_back(op_location);
+        if (!op.synced) {
+            impl->pending_unregister.push_back(op_location);
+        }
     };
     static_assert(sizeof(operation_body) <= 48,
                   "the report operation must fit MSVC's std::function storage");
     std::function<void()> operation(operation_body);
     if (is_fence) {
-        VideoCore::g_signaling_query_report_fence = true;
+        VideoCommon::ReportSlots::Issue(cpu_addr);
+        VideoCore::g_signaling_query_report_fence = !is_synced;
         impl->rasterizer.SignalFence(std::move(operation));
         VideoCore::g_signaling_query_report_fence = false;
+        if (is_synced) {
+            streamer->Free(new_query_id);
+            return;
+        }
     } else {
         if (immediate) {
             FinishReads(cpu_addr, has_timestamp ? 16 : 4);
@@ -431,6 +466,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             streamer->Free(new_query_id);
             return;
         }
+        VideoCommon::ReportSlots::Issue(cpu_addr);
         impl->rasterizer.SyncOperation(std::move(operation));
     }
     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);

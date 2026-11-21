@@ -85,11 +85,17 @@
 #include "core/tools/renderdoc.h"
 #include "hid_core/hid_core.h"
 #include "network/network.h"
+#include "video_core/dlss_mode.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
+
+#ifndef _WIN32
+extern char** environ;
+#endif
 
 namespace Core {
 
@@ -155,6 +161,43 @@ std::optional<u64> Switch2ProgramId(FileSys::ProgramMetadata& metadata,
         return std::nullopt;
     }
     return metadata.GetTitleID();
+}
+
+// One line with what decides a session's image and frame rate, so a report's log says it up front.
+void LogBootSummary(u64 program_id) {
+    const auto& v = Settings::values;
+    const auto preset = v.nvidia_dlss_preset.GetValue();
+    const auto effective = VideoCommon::DlssMode::EffectivePreset(program_id, preset);
+    std::string switches;
+#ifdef _WIN32
+    char** const environment = _environ;
+#else
+    char** const environment = environ;
+#endif
+    for (char** entry = environment; entry && *entry; ++entry) {
+        const std::string_view variable{*entry};
+        if (variable.starts_with("EDEN_NX2_") || variable.starts_with("EDEN_DKB_")) {
+            switches += switches.empty() ? "" : " ";
+            switches += variable;
+        }
+    }
+    const bool dusk_scaled = program_id == 0x0400D1D02399A000ULL &&
+                             v.resolution_info.up_scale > (1U << v.resolution_info.down_shift);
+    LOG_INFO(Core,
+             "Nx2Summary boot: program {:016X}, resolution {} ({:.2f}x), upscaler {}, DLSS mode {}, "
+             "preset {}{}, accuracy {}, vsync {}, window filter {}, fullscreen {}, memory layout {}, "
+             "pin GPU threads {}, switches [{}]{}",
+             program_id, v.resolution_setup.ToString(), v.resolution_info.up_factor,
+             v.nvidia_dlss.GetValue() ? "NVIDIA DLSS (FSR 3.1 if unavailable)" : "FSR 3.1",
+             v.nvidia_dlss_quality.ToString(), v.nvidia_dlss_preset.ToString(),
+             effective != preset ? fmt::format(" (runs {})", Settings::CanonicalizeEnum(effective))
+                                 : std::string{},
+             v.gpu_accuracy.ToString(), v.vsync_mode.ToString(), v.scaling_filter.ToString(),
+             v.fullscreen_mode.ToString(), v.memory_layout_mode.ToString(),
+             v.pin_gpu_threads.ToString(), switches,
+             dusk_scaled ? "; Duskbloods above 1x renders the scene and the upscale at 4x the "
+                           "pixels or more, tested at 1x"
+                         : "");
 }
 
 } // namespace
@@ -611,6 +654,54 @@ struct System::Impl {
 
         // Expose program id to dump sites and other global readers.
         Settings::SetCurrentProgramID(params.program_id);
+        if (params.program_id == 0x0400D1D02399A000ULL) {
+            // One line naming the Duskbloods variants in effect (each switch is read where it acts;
+            // these are the same rules).
+            const auto env = [](const char* name) {
+                const char* value = std::getenv(name);
+                return std::string{value ? value : ""};
+            };
+            const auto flag = [&](const char* name, bool unset) {
+                const auto value = env(name);
+                return value.empty() ? unset : value[0] != '0';
+            };
+            const u32 back_off = VideoCommon::BackX::DuskOffMaskFromEnv(params.program_id);
+            LOG_INFO(Core,
+                     "Duskbloods variants: stack lowering {}, host-timing wait {}, upload stale {}, "
+                     "GPU-only regions {}, totals {} remote memory, AOFFI gather {}, "
+                     "host-timing priority {}, compute write mark {}, compute size word {}, ribbon {}, "
+                     "back cuts {} [{}], loaded-pointer loads {}, report reads wait {}, collector "
+                     "GPU waits {}, list-fed grid macros reverted (#1651)",
+                     env("EDEN_NX2_DUSK_STACK") == "upstream" ? "upstream (#1490)" : "v25 (fold)",
+                     flag("EDEN_NX2_HOSTTIMING_SPIN", true) ? "spin (v2.5)" : "OS sleep (#1016)",
+                     env("EDEN_NX2_UPLOAD_STALE").empty() || env("EDEN_NX2_UPLOAD_STALE")[0] == '1'
+                         ? "on (v2.5)"
+                         : "off (#818)",
+                     env("EDEN_NX2_GPU_MAP_FLAG_PROBE").empty() ||
+                             env("EDEN_NX2_GPU_MAP_FLAG_PROBE")[0] == '1'
+                         ? "client tile backing (v2.5)"
+                         : "server backed (#552)",
+                     env("EDEN_NX2_TOTAL_MINUS_REMOTE").starts_with('1') ? "minus (#552)"
+                                                                         : "include (v2.5)",
+                     env("EDEN_NX2_DUSK_GATHER") == "draw" ? "draw (#1363)" : "skip (v2.5)",
+                     flag("EDEN_NX2_HOSTTIMING_PRIO", true) ? "time critical" : "very high",
+                     env("EDEN_NX2_DUSK_SSBO_MARK") == "auto" ? "store extent (#816)"
+                                                              : "whole binding (v2.5)",
+                     env("EDEN_NX2_DUSK_SSBO_SIZE") == "v25" ? "8 MiB cap (v2.5)"
+                                                             : "read (#1231)",
+                     env("EDEN_NX2_DUSK_RIBBON") == "skip"   ? "skipped"
+                     : env("EDEN_NX2_DUSK_RIBBON") == "diag" ? "drawn, traced"
+                                                             : "drawn",
+                     back_off == 0 ? "upstream (#1586, #1585, #1095)"
+                                   : "old (pre-#1586, pre-#1585, pre-#1095) where =old",
+                     VideoCommon::BackX::DuskPiecesText(back_off),
+                     flag("EDEN_NX2_DUSK_LOADED_REBASE", true) ? "rebased" : "routed",
+                     env("EDEN_NX2_LEAN_REPORT_WAIT") == "verify"
+                         ? "for their reports, verified"
+                         : (flag("EDEN_NX2_LEAN_REPORT_WAIT", true) ? "for their reports (#559)"
+                                                                    : "for all GPU work"),
+                     flag("EDEN_NX2_TC_ONE_WAIT", true) ? "one a frame" : "unlimited");
+        }
 
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);
@@ -661,6 +752,7 @@ struct System::Impl {
         }
 
         GameSettings::LoadOverrides(program_id, gpu_core->Renderer());
+        LogBootSummary(params.program_id);
         if (auto room_member = Network::GetRoomMember().lock()) {
             Network::GameInfo game_info;
             game_info.name = name;

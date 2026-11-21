@@ -30,6 +30,7 @@
 #include "common/common_types.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/hash.h"
+#include "common/settings.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
 #include <ranges>
@@ -39,9 +40,11 @@
 #include "common/thread_worker.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/dlss_mode.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
 #include "video_core/texture_cache/image_base.h"
@@ -169,6 +172,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 gc_deletes{};
     u64 gc_costly_deletes{};
     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
+    u64 gc_kept_written{};     ///< GPU-written images kept while host commit bounds the cache
+    u64 gc_downloads_deferred{}; ///< Downloads left for a later frame (one GPU wait a frame)
+    u64 gc_waited_frame{~0ULL};  ///< The frame of the collector's last download wait
     u64 async_decodes_queued{};
     u64 images_created{};
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
@@ -185,6 +191,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// (6.48 GB) and the collector deleted ~40 recently used images a frame again; images that
     /// do not fit add to the out-of-memory margin.
     u64 retention_limit{};
+    /// Host commit, not the device budget, sets the critical threshold, and the commit the
+    /// system can still hand out (at the last threshold check).
+    bool commit_bound{};
+    u64 host_commit_room{};
     u64 retention_budget{}; ///< The lowest driver budget read lately (RetentionBudget)
     u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
@@ -351,6 +361,14 @@ public:
     /// Whether sampling the views now needs PrepareImageView: an image with an upload pending or
     /// a newer alias to copy in (fast draw delta draws keep their views and prepare none).
     [[nodiscard]] bool SampledViewsChange(std::span<const ImageViewInOut> views) const noexcept {
+        // alias_full_resolve (Nx2Perf): any sampled image with aliases takes the full path.
+        if (Nx2Perf::AliasOn(Nx2Perf::Alias::FullResolve) &&
+            std::ranges::any_of(views, [&](const ImageViewInOut& view) {
+                return PreparesImage(slot_image_views, view.id) &&
+                       !slot_images[slot_image_views[view.id].image_id].aliased_images.empty();
+            })) {
+            return true;
+        }
         return VideoCommon::SampledViewsChange(views, slot_image_views, slot_images);
     }
 
@@ -413,6 +431,37 @@ public:
         return std::exchange(churn, {});
     }
 
+    /// The guest memory [gpu_addr, +size) of colour target `index` when a clear of `area` (host
+    /// pixels, from the origin) covers all of it: a single-level, single-layer 2D image whose
+    /// view starts at its base. nullopt otherwise.
+    [[nodiscard]] std::optional<std::pair<GPUVAddr, u64>> CoveredColorTarget(size_t index,
+                                                                             u32 area_width,
+                                                                             u32 area_height) {
+        const ImageViewId view_id = render_targets.color_buffer_ids[index];
+        if (!view_id) {
+            return std::nullopt;
+        }
+        const ImageView& view = slot_image_views[view_id];
+        if (!view.image_id || view.range.base.layer != 0 || view.range.base.level != 0) {
+            return std::nullopt;
+        }
+        const Image& image = slot_images[view.image_id];
+        if (image.info.type != ImageType::e2D || image.info.resources.levels != 1 ||
+            image.info.resources.layers != 1) {
+            return std::nullopt;
+        }
+        u32 width = image.info.size.width;
+        u32 height = image.info.size.height;
+        if (True(image.flags & ImageFlagBits::Rescaled)) {
+            width = Settings::values.resolution_info.ScaleUp(width);
+            height = Settings::values.resolution_info.ScaleUp(height);
+        }
+        if (area_width < width || area_height < height) {
+            return std::nullopt;
+        }
+        return std::pair{image.gpu_addr, image.guest_size_bytes};
+    }
+
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
 
@@ -449,7 +498,8 @@ public:
                          const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                          const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale, bool use_history,
-                         std::optional<std::array<u32, 2>> render_region = std::nullopt);
+                         std::optional<std::array<u32, 2>> render_region = std::nullopt,
+                         const std::pair<ImageInfo, GPUVAddr>* depth_target = nullptr);
 
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.
@@ -649,7 +699,7 @@ private:
     void MarkModification(ImageBase& image) noexcept;
 
     /// Synchronize image aliases, copying data if needed
-    void SynchronizeAliases(ImageId image_id);
+    void SynchronizeAliases(ImageId image_id, bool after_upload = false);
 
     /// Prepare an image view to be used
     void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate);
@@ -681,9 +731,54 @@ private:
                                                       bool mark_as_modified);
 
     bool ImageCanRescale(ImageBase& image);
+    bool ImageCanRescaleUnpinned(ImageBase& image);
+    /// The Duskbloods' shadow maps (square depth targets, 1024 and up) stay at 1x: scaled they
+    /// cost up to 4.6 ms a frame on an RTX 3060 and four times the memory (8192x8192 at 2x) for
+    /// sharper shadow edges only.
+    [[nodiscard]] static bool DuskShadowMap(const ImageBase& image) {
+        const auto& info = image.info;
+        return VideoCore::Surface::GetFormatType(info.format) !=
+                   VideoCore::Surface::SurfaceType::ColorTexture &&
+               info.size.width == info.size.height && info.size.width >= 1024 &&
+               Settings::GetCurrentProgramID() == DlssMode::DuskbloodsProgramId;
+    }
     void InvalidateScale(Image& image);
-    bool ScaleUp(Image& image);
-    bool ScaleDown(Image& image);
+    void NoteRescale(Image& image, bool up, Nx2Perf::RescaleReason reason);
+    bool ScaleUp(Image& image, Nx2Perf::RescaleReason reason = Nx2Perf::RescaleReason::Other);
+    bool ScaleDown(Image& image, Nx2Perf::RescaleReason reason = Nx2Perf::RescaleReason::Other);
+    /// rescale_pin: an image that keeps bouncing between scales (a render target also written as
+    /// a storage image, or bound with a target that can't scale) stays at 1x, and so do the
+    /// targets bound with it, instead of being resampled twice a frame.
+    [[nodiscard]] bool Pinned(const ImageBase& image) const noexcept {
+        return pin_active && image.native_pin == pin_generation;
+    }
+    void MaybePin(Image& image);
+    /// pin_main: unpins an image.
+    void ReleasePin(Image& image);
+    /// pin_main: an image The Duskbloods' upscaler took in the last two frames (its colour,
+    /// motion, depth and output). Never pinned, and wins
+    /// over pinned partners.
+    [[nodiscard]] bool IsMain(const ImageBase& image) const noexcept {
+        return pin_main && image.main_tick != 0 && frame_tick <= image.main_tick + 1;
+    }
+    /// pin_main: when one of these images is the main frame, the pinned ones are released (their
+    /// flip streak stays, so they can be pinned again). True when any was released.
+    bool ReleaseNearMain(std::span<const ImageId> ids);
+    /// A pass that would take a main frame image to 1x: notes the targets holding it back
+    /// (Rescale line, main_blockers) and, with main_partner, true when all of them can follow
+    /// it up (held back only by their aliases).
+    bool RaiseMainPartners(std::span<const ImageId> ids);
+    /// pin_strict: a pinned image stays at 1x on every path.
+    [[nodiscard]] bool PinBlocks(const ImageBase& image) const noexcept {
+        return pin_strict && Pinned(image);
+    }
+    /// The upscaler's colour, depth and motion inputs at the last upscale, for their age.
+    struct UpscaleSeen {
+        ImageId id{};
+        u64 modification_tick{};
+        u32 age{};
+    };
+    std::array<UpscaleSeen, 3> upscale_seen{};
     u64 GetScaledImageSizeBytes(const ImageBase& image);
 
     /// The device memory an image counts for in total_used_memory between two driver readings:
@@ -879,6 +974,23 @@ private:
     /// set first_written_frame, not blits, copies or DMA.
     bool drawing_render_targets = false;
     bool is_rescaling = false;
+    /// rescale_pin: on, and the generation of the pins (a new one when it changes, which lets
+    /// every pinned image scale again).
+    bool pin_active = false;
+    bool pin_main = false, pin_strict = false;
+    /// frame_tick of the last upscale with a depth target: pins are taken only in gameplay.
+    u64 last_upscale_tick = 0;
+    u32 pin_generation = 1;
+    /// rescale_pin: the pins by address, so an image the collector deleted and the game made again
+    /// (same size and format) starts pinned instead of bouncing again (289 pins in ten minutes of
+    /// The Duskbloods at 2x were all on images made again).
+    struct PinnedShape {
+        u32 width{};
+        u32 height{};
+        PixelFormat format{};
+        u32 generation{};
+    };
+    std::unordered_map<GPUVAddr, PinnedShape> pinned_shapes;
     /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
     bool depth_target_padded = false;
     u64 total_used_memory = 0;

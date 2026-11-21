@@ -24,6 +24,8 @@
 #include "common/div_ceil.h"
 #include "common/literals.h"
 #include "common/settings.h"
+#include "video_core/dlss_mode.h"
+#include "video_core/nx2_perf.h"
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
 
@@ -2012,11 +2014,7 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
 
 bool TextureCacheRuntime::UsesNvidiaDlss() const {
 #ifdef EGLANTINE_STREAMLINE
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    return !force_fsr && !dlss_unsupported && Streamline::IsDlssAvailable();
+    return !dlss_unsupported && Streamline::IsDlssAvailable() && Streamline::DlssWanted();
 #else
     return false;
 #endif
@@ -2037,22 +2035,40 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView& motion_vectors, ImageView& depth,
                                           std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale) {
+                                          std::array<f32, 2> motion_scale,
+                                          std::array<u32, 2> max_render_size) {
     if (!WantsTemporalUpscaleDepth()) {
         return false;
     }
     const VkExtent2D extent = dst_framebuffer->RenderArea();
-    // A gap in the evaluations (a menu, a movie, a load) starts the history again.
+    // A gap in the evaluations (a menu, a movie, a load) starts the history again. The gap is 4
+    // smoothed frame intervals, at least 250 ms: at 8 FPS ordinary frame time spikes passed a
+    // fixed 250 ms and restarted the history (a visible pop) several times a minute.
     const auto now = std::chrono::steady_clock::now();
     const f32 frame_time_ms =
         fsr3_last_evaluation
             ? std::chrono::duration<f32, std::milli>(now - *fsr3_last_evaluation).count()
             : 1000.0f / 30.0f;
-    const bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f;
+    const f32 reset_gap_ms = (std::max)(250.0f, 4.0f * upscale_interval_ms);
+    bool reset = !fsr3_last_evaluation || frame_time_ms > reset_gap_ms;
+    if (fsr3_last_evaluation && frame_time_ms <= reset_gap_ms) {
+        upscale_interval_ms += (frame_time_ms - upscale_interval_ms) * 0.1f;
+    }
     fsr3_last_evaluation = now;
+    VideoCommon::Nx2Perf::g_upscales.fetch_add(1, std::memory_order_relaxed);
+    if (reset) {
+        VideoCommon::Nx2Perf::g_upscale_resets.fetch_add(1, std::memory_order_relaxed);
+    }
+    scheduler.MarkGpu(Scheduler::GpuMark::UpscaleBegin);
 #ifdef EGLANTINE_STREAMLINE
+    // Switching between DLSS and FSR 3.1 (the status bar's upscaler button) starts the history
+    // again; both upscalers stay allocated, so switching back costs nothing more.
+    const bool dlss = UsesNvidiaDlss();
+    reset = reset || dlss != temporal_dlss;
+    temporal_dlss = dlss;
     if (UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
-                        motion_scale, reset)) {
+                        motion_scale, reset, max_render_size)) {
+        VideoCommon::Nx2Perf::g_upscaler.store(2, std::memory_order_relaxed);
         return true;
     }
 #endif
@@ -2095,6 +2111,7 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             .motion_vectors = motion_vectors.Handle(Shader::TextureType::Color2D),
             .render_size = {render_size[0], render_size[1]},
             .upscale_size = extent,
+            .max_render_size = {max_render_size[0], max_render_size[1]},
             .jitter = jitter,
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
@@ -2110,7 +2127,8 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
         return false;
     }
     DrawUpscaledOutput(dst_framebuffer, fsr3_upscaler->OutputView(), fsr3_upscaler->OutputImage(),
-                       fsr3_upscaler->PointSampler());
+                       fsr3_upscaler->PointSampler(), extent);
+    VideoCommon::Nx2Perf::g_upscaler.store(1, std::memory_order_relaxed);
     static bool logged{};
     if (!logged) {
         logged = true;
@@ -2121,17 +2139,22 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
 }
 
 void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view,
-                                             VkImage output, VkSampler sampler) {
+                                             VkImage output, VkSampler sampler,
+                                             VkExtent2D source_size) {
     // Draw the result into the DLSS output, which keeps its own format; the blit leaves the
     // upscaler's output image in SHADER_READ_ONLY_OPTIMAL, so return it to GENERAL for the next
-    // frame.
+    // frame. A smaller result (DLAA's render-sized one) is stretched over it with the sampler.
     const VkExtent2D extent = dst_framebuffer->RenderArea();
     const Region2D region{
         .start = {0, 0},
         .end = {static_cast<s32>(extent.width), static_cast<s32>(extent.height)},
     };
-    blit_image_helper.BlitColor(dst_framebuffer, view, output, sampler, region, region,
-                                {extent.width, extent.height, 1});
+    const Region2D source{
+        .start = {0, 0},
+        .end = {static_cast<s32>(source_size.width), static_cast<s32>(source_size.height)},
+    };
+    blit_image_helper.BlitColor(dst_framebuffer, view, output, sampler, region, source,
+                                {source_size.width, source_size.height, 1});
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([output](vk::CommandBuffer cmdbuf) {
         const VkImageMemoryBarrier barrier{
@@ -2155,6 +2178,7 @@ void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkIma
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier);
     });
+    scheduler.MarkGpu(Scheduler::GpuMark::UpscaleEnd);
 }
 
 #ifdef EGLANTINE_STREAMLINE
@@ -2162,18 +2186,19 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView& motion_vectors, ImageView& depth,
                                           std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale, bool reset) {
-    // EDEN_NX2_DLSS_REPLACEMENT=fsr keeps FSR 3.1 for A/B runs.
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    if (force_fsr || dlss_unsupported) {
+                                          std::array<f32, 2> motion_scale, bool reset,
+                                          std::array<u32, 2> max_render_size) {
+    // FSR 3.1 when DLSS is off (the setting, the upscaler button or EDEN_NX2_DLSS_REPLACEMENT=fsr).
+    if (dlss_unsupported || !Streamline::DlssWanted()) {
         return false;
     }
     if (!dlss_upscaler) {
-        // Off in the settings, or Streamline didn't start: it has said why.
+        // Streamline didn't start: it has said why, or DLSS was off when the game started.
         if (!Streamline::IsDlssAvailable()) {
+            if (Streamline::Requested()) {
+                StreamlineDlssUpscaler::NoteFallback(
+                    "Streamline did not start or attach (see the log above)");
+            }
             dlss_unsupported = true;
             return false;
         }
@@ -2183,6 +2208,7 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         } catch (const vk::Exception& exception) {
             LOG_WARNING(Render_Vulkan, "NVIDIA DLSS unavailable ({}); using FSR 3.1",
                         exception.what());
+            StreamlineDlssUpscaler::NoteFallback(exception.what());
             dlss_unsupported = true;
             return false;
         }
@@ -2203,10 +2229,21 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .barrier_aspect = ImageAspectMask(view.format),
         };
     };
-    const bool native_resolution =
-        Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
-    const VkExtent2D extent = native_resolution ? VkExtent2D{render_size[0], render_size[1]}
-                                                : dst_framebuffer->RenderArea();
+    // An image's size on the host (after resolution scaling); the render size is a region of it.
+    const auto host_size = [&](const ImageView& view) {
+        const Image* const backing = view.BackingImage();
+        return backing && backing->IsRescaled()
+                   ? VkExtent2D{resolution.ScaleUp(view.size.width),
+                                resolution.ScaleUp(view.size.height)}
+                   : VkExtent2D{view.size.width, view.size.height};
+    };
+    // The Duskbloods never runs DLAA or Ultra Performance (DlssMode::EffectiveQuality).
+    const auto quality = VideoCommon::DlssMode::EffectiveQuality(
+        Settings::GetCurrentProgramID(), Settings::GetNvidiaDlssRuntimeSettings().quality);
+    const bool native_resolution = quality == Settings::NvidiaDlssQuality::Native;
+    const VkExtent2D target = dst_framebuffer->RenderArea();
+    const VkExtent2D extent =
+        native_resolution ? VkExtent2D{render_size[0], render_size[1]} : target;
     bool upscaled{};
     try {
         upscaled = dlss_upscaler->Upscale({
@@ -2222,18 +2259,24 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
             .reset = reset,
+            .depth_size = host_size(depth),
+            .color_size = {max_render_size[0], max_render_size[1]},
+            .motion_size = host_size(motion_vectors),
         });
     } catch (const vk::Exception& exception) {
         LOG_WARNING(Render_Vulkan, "NVIDIA DLSS evaluation unavailable ({}); using FSR 3.1",
                     exception.what());
+        StreamlineDlssUpscaler::NoteFallback(exception.what());
     }
     if (!upscaled) {
+        StreamlineDlssUpscaler::NoteFallback("evaluation failed (see the log above)");
         dlss_unsupported = true;
         return false;
     }
+    const bool stretched = extent.width != target.width || extent.height != target.height;
     DrawUpscaledOutput(dst_framebuffer, dlss_upscaler->OutputView(), dlss_upscaler->OutputImage(),
-                       native_resolution ? dlss_upscaler->LinearSampler()
-                                         : dlss_upscaler->PointSampler());
+                       stretched ? dlss_upscaler->LinearSampler() : dlss_upscaler->PointSampler(),
+                       extent);
     static bool logged{};
     if (!logged) {
         logged = true;
@@ -2302,15 +2345,21 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                         !same_size(motion_vectors))) {
         return false;
     }
-    if (use_history && depth &&
-        (!VideoCommon::DlssContract::IsUpscalerDepthFormat(depth->format) || !plain(*depth) ||
-         !fits(*depth, render_size) || !same_size(*depth))) {
-        return false;
+    // The Duskbloods prepass can supply these depth formats in addition to the generic DLSS set.
+    const auto depth_format_ok = [](PixelFormat format) {
+        return VideoCommon::DlssContract::IsUpscalerDepthFormat(format) ||
+               format == PixelFormat::D32_FLOAT || format == PixelFormat::D24_UNORM_S8_UINT ||
+               format == PixelFormat::X8_D24_UNORM || format == PixelFormat::D32_FLOAT_S8_UINT;
+    };
+    if (use_history && depth && (!depth_format_ok(depth->format) || !plain(*depth) ||
+                                 !fits(*depth, render_size) || !same_size(*depth))) {        return false;
     }
+    // A region of the input (The Duskbloods' dynamic resolution) is at most the input's size.
+    const std::array<u32, 2> max_render_size =
+        whole_input ? render_size : host_extent(input_color).value_or(render_size);
     if (use_history && depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
-                                 jitter, motion_scale)) {
-        report(UsesNvidiaDlss() ? "NVIDIA DLSS" : "FSR 3.1", "all inputs present");
-        return true;
+                                 jitter, motion_scale, max_render_size)) {
+        report(UsesNvidiaDlss() ? "NVIDIA DLSS" : "FSR 3.1", "all inputs present");        return true;
     }
     const VkFormat format =
         MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, dst.format).format;
@@ -4466,13 +4515,17 @@ bool Image::ScaleUp(bool ignore) {
     if (aspect_mask == 0) {
         aspect_mask = ImageAspectMask(info.format);
     }
+    scheduler->PassRescale(true);
+    bool blitted = true;
     if (NeedsScaleHelper()) {
-        if (!BlitScaleHelper(true)) {
-            current_image = &Image::original_image;
-            return false;
-        }
+        blitted = BlitScaleHelper(true);
     } else {
         BlitScale(*scheduler, *original_image, *scaled_image, info, aspect_mask, resolution);
+    }
+    scheduler->PassRescale(false);
+    if (!blitted) {
+        current_image = &Image::original_image;
+        return false;
     }
     return true;
 }
@@ -4494,14 +4547,18 @@ bool Image::ScaleDown(bool ignore) {
     if (aspect_mask == 0) {
         aspect_mask = ImageAspectMask(info.format);
     }
+    scheduler->PassRescale(true);
+    bool blitted = true;
     if (NeedsScaleHelper()) {
-        if (!BlitScaleHelper(false)) {
-            current_image = &Image::scaled_image;
-            flags |= ImageFlagBits::Rescaled;
-            return false;
-        }
+        blitted = BlitScaleHelper(false);
     } else {
         BlitScale(*scheduler, *scaled_image, *original_image, info, aspect_mask, resolution, false);
+    }
+    scheduler->PassRescale(false);
+    if (!blitted) {
+        current_image = &Image::scaled_image;
+        flags |= ImageFlagBits::Rescaled;
+        return false;
     }
     return true;
 }
@@ -5310,6 +5367,26 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     }
     if (num_layers == (std::numeric_limits<s32>::max)()) {
         num_layers = 1;
+    }
+    {
+        const ImageView* first_color = nullptr;
+        for (const ImageView* const view : color_buffers) {
+            if (view) {
+                first_color = view;
+                break;
+            }
+        }
+        const ImageView* const sized = first_color ? first_color : depth_buffer;
+        pass_label = PassLabel{
+            .color_addr = first_color ? first_color->gpu_addr : 0,
+            .depth_addr = depth_buffer ? depth_buffer->gpu_addr : 0,
+            .width = sized ? sized->size.width : 0,
+            .height = sized ? sized->size.height : 0,
+            .color_format = first_color ? static_cast<u32>(first_color->format) : 0,
+            .depth_format = depth_buffer ? static_cast<u32>(depth_buffer->format) : 0,
+            .colors = static_cast<u32>(num_colors),
+            .scaled = is_rescaled,
+        };
     }
     layers = static_cast<u32>((std::max)(num_layers, 1));
     LOG_DEBUG(Render_Vulkan,

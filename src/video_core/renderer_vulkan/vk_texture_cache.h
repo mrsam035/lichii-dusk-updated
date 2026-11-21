@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #endif
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
+#include "video_core/renderer_vulkan/pass_label.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -285,7 +286,7 @@ public:
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
                          ImageView& motion_vectors, ImageView& depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale);
+                         std::array<f32, 2> motion_scale, std::array<u32, 2> max_render_size);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
     /// The backend that last drew a DLSS replacement and why, so each change is logged once.
@@ -302,19 +303,25 @@ public:
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
+    /// Smoothed time between upscales: a gap of 4 of these (at least 250 ms) resets the history.
+    f32 upscale_interval_ms = 1000.0f / 30.0f;
 
-    /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
+    /// Draws an upscaler's RGBA16F output (source_size of it) over the DLSS output and returns it
+    /// to GENERAL.
+    /// A smaller output (DLAA's render-sized one) is stretched.
     void DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
-                            VkSampler sampler);
+                            VkSampler sampler, VkExtent2D source_size);
 #ifdef EGLANTINE_STREAMLINE
     /// NVIDIA's DLSS (through NVIDIA Streamline) in place of the game's,
     /// before FSR 3.1, when the setting is on. Returns false to fall back to FSR 3.1.
     bool UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageView& input_color,
                          ImageView& motion_vectors, ImageView& depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool reset);
+                         std::array<f32, 2> motion_scale, bool reset,
+                         std::array<u32, 2> max_render_size);
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
     bool dlss_unsupported{};
+    bool temporal_dlss{}; ///< The last TemporalUpscale was meant for DLSS
 #endif
 
     /// TemporalUpscale's history: its previous result (images[current]) and the image the next
@@ -481,6 +488,11 @@ public:
         return is_rescaled;
     }
 
+    /// Its targets, for the per-pass GPU timing.
+    [[nodiscard]] const PassLabel& Label() const noexcept {
+        return pass_label;
+    }
+
     [[nodiscard]] bool DiscardsMsaaColor() const noexcept {
         return discard_msaa_color;
     }
@@ -516,6 +528,7 @@ private:
     RenderPassCache* render_pass_cache{nullptr};
     bool discard_msaa_color{};
     bool discard_msaa_depth_stencil{};
+    PassLabel pass_label{};
     mutable std::array<u32, NUM_MEMOIZED_RENDER_PASS_VARIANTS> variant_keys{};
     mutable std::array<VkRenderPass, NUM_MEMOIZED_RENDER_PASS_VARIANTS> variant_render_passes{};
     mutable u32 num_memoized_variants{};
