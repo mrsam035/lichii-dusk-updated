@@ -16,7 +16,7 @@
 <details name="lang" open>
 <summary><b>English: open the guide</b></summary>
 
-**This is a fork of [zortos293/Lichii](https://github.com/zortos293/Lichii) (nx2, newest upstream after build 341), tuned to run *The Duskbloods Network Test* (program `0400D1D02399A000`) on Windows PCs.**
+**This is a fork of [zortos293/Lichii](https://github.com/zortos293/Lichii) (current nx2 line: Lichii Build 366 plus subsequent upstream updates), tuned to run *The Duskbloods Network Test* (program `0400D1D02399A000`) on Windows PCs.**
 It pairs with the [playDB-CNT](https://github.com/sikoGD/playDB-CNT) launcher by sikoGD, which provides the local network-test servers the game needs to get in-game. The launcher is a separate download: see the two boxes below.
 
 > Not affiliated with Nintendo, FromSoftware or the upstream projects. No games, keys or firmware are included. Use only files you have legally dumped yourself.
