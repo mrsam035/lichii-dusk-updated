@@ -1,0 +1,79 @@
+name: audit-dusk-v4-merge
+
+on:
+  push:
+    branches: [update/test-build366-base]
+
+permissions:
+  contents: read
+
+jobs:
+  merge-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out current Build 366+ base
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Duskbloods fork and inspect the real merge
+        id: merge
+        shell: bash
+        run: |
+          set -u
+          git remote add dusk https://github.com/Mr-Tb/lichii-dusk.git
+          git fetch --no-tags dusk refs/heads/dusk-v4
+          base="$(git rev-parse HEAD)"
+          dusk="$(git rev-parse FETCH_HEAD)"
+          common="$(git merge-base "$base" "$dusk")"
+          {
+            echo "Build 366+ base: $base"
+            echo "Dusk v4 head: $dusk"
+            echo "Merge base: $common"
+            echo
+            echo "Dusk-only commits:"
+            git rev-list --count "$common..$dusk"
+            echo "Upstream-only commits:"
+            git rev-list --count "$common..$base"
+            echo
+            echo "Attempting a real three-way merge (no files will be committed)."
+          } | tee merge-audit.txt
+          git -c user.name=merge-audit -c user.email=merge-audit@example.invalid             merge --no-commit --no-ff "$dusk" >> merge-audit.txt 2>&1 || true
+          conflicts="$(git diff --name-only --diff-filter=U || true)"
+          {
+            echo
+            echo "Conflicting files:"
+            if [ -n "$conflicts" ]; then
+              printf '%s\n' "$conflicts"
+            else
+              echo "(none)"
+            fi
+            echo
+            echo "Conflict count: $(printf '%s\n' "$conflicts" | sed '/^$/d' | wc -l)"
+            echo
+            echo "Per-file merge state:"
+            git status --short
+          } | tee -a merge-audit.txt
+          mkdir -p merge-conflicts
+          if [ -n "$conflicts" ]; then
+            while IFS= read -r file; do
+              [ -n "$file" ] || continue
+              mkdir -p "merge-conflicts/$(dirname "$file")"
+              git show ":1:$file" > "merge-conflicts/$file.base" 2>/dev/null || true
+              git show ":2:$file" > "merge-conflicts/$file.upstream" 2>/dev/null || true
+              git show ":3:$file" > "merge-conflicts/$file.dusk" 2>/dev/null || true
+            done <<< "$conflicts"
+          fi
+          echo "conflict_count=$(printf '%s\n' "$conflicts" | sed '/^$/d' | wc -l)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload merge audit and conflict-side files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichii-366-dusk-v4-merge-audit
+          path: |
+            merge-audit.txt
+            merge-conflicts/
+          if-no-files-found: warn
+          retention-days: 7
